@@ -1,0 +1,5 @@
+streamlit==1.56.0
+python-dotenv==1.2.2
+pymupdf4llm==1.27.2.3
+requests==2.33.1
+Pillow==12.2.0

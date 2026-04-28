@@ -1,0 +1,21 @@
+# Environment
+.env
+
+# Local data and results
+data/
+
+# User schema (local configuration)
+.schema.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# macOS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
