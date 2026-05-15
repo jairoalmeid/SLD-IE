@@ -1,5 +1,10 @@
 streamlit==1.56.0
 python-dotenv==1.2.2
-pymupdf4llm==1.27.2.3
+pymupdf==1.27.2.3
 requests==2.33.1
 Pillow==12.2.0
+plotly==6.7.0
+pandas==2.3.3
+PyYAML==6.0
+networkx==3.1
+json-repair==0.58.7
