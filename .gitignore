@@ -1,24 +1,22 @@
-# Environment
-.env
+# Virtual environment
+.venv/
+venv/
+ENV/
 
-# Local data and results
-data/
-
-# User schema (local configuration)
-.schema.json
-
-# Python
+# Byte-compiled / Python cache
 __pycache__/
-*.pyc
-*.pyo
-.Python
+*.py[cod]
+*$py.class
+*.so
 
-# macOS
-.DS_Store
+# Output directory (data generated at runtime)
+output/
 
-# IDEs
+# Testing & IDEs
+.pytest_cache/
+.coverage
+htmlcov/
 .vscode/
 .idea/
-
-# Anotações
-Notes
+*.swp
+.DS_Store
