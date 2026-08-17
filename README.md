@@ -157,4 +157,17 @@ A arquitetura de UI do **SLD** foi estruturada em um **Design System centralizad
 - **Pipeline Stepper Compacto (`render_pipeline_stepper`):** Barra visual indicando o status das 8 etapas do pipeline (`✓ concluído`, `● atual`, `○ pendente`).
 - **Hierarquia de Botões:** Botão primário escuro exclusivo para a ação principal da etapa; exportações e filtros utilizam botões secundários; operações destrutivas ficam abrigadas na *Zona de Manutenção*.
 
+## Transparência e Uso de IA
+
+Este projeto foi desenvolvido combinando programação tradicional e auxílio de ferramentas de Inteligência Artificial:
+
+* **Desenvolvimento de Código**: Utilizado o auxílio de IA (Antigravity Vibe Code) para suporte no desenvolvimento de trechos de código e estruturação de partes do sistema. **Todo o código gerado por IA passou por criteriosa análise, revisão, refatoração e validação técnica manual do desenvolvedor.**
+* **Identidade Visual**: As artes e imagens visuais da marca e interface foram geradas utilizando a ferramenta **nano banana**.
+
+---
+
+## Autor e Créditos
+
+Desenvolvido por **Jairo Almeida** — [github.com/jairoalmeid](https://github.com/jairoalmeid)
+
 
