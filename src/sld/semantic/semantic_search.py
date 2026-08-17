@@ -223,37 +223,19 @@ def perform_multi_anchor_search(
 
         # 5. Processamento dos resultados por parágrafo dentro do batch
         for idx_in_batch, seg in enumerate(b_segments):
-            scores_per_anchor: Dict[str, float] = {}
+            row_sims = sim_matrix[idx_in_batch]
+            scores_per_anchor: Dict[str, float] = {
+                anchors[j].id: float(row_sims[j]) for j in range(num_anchors)
+            }
+            best_anchor_idx = int(np.argmax(row_sims))
+            best_score = float(row_sims[best_anchor_idx])
+            best_anchor_id = anchors[best_anchor_idx].id
+            best_anchor_text = anchors[best_anchor_idx].text
 
-            if aggregation_strategy == "maximum" and top_k_anchors == 1:
-                # Otimização vetorizada direta para a estratégia padrão
-                row_sims = sim_matrix[idx_in_batch]
-                best_anchor_idx = int(np.argmax(row_sims))
-                agg_score = float(row_sims[best_anchor_idx])
-
-                best_anchor_id = anchors[best_anchor_idx].id
-                best_anchor_text = anchors[best_anchor_idx].text
-                scores_per_anchor[best_anchor_id] = agg_score
+            if aggregation_strategy == "maximum":
+                agg_score = best_score
             else:
-                row_sims = sim_matrix[idx_in_batch]
-                best_score = -1.0
-                best_anchor_id = anchors[0].id
-                best_anchor_text = anchors[0].text
-
-                # Seleciona top-k âncoras ou registra todas as âncoras conforme top_k_anchors
-                top_k_indices = np.argsort(row_sims)[::-1][:max(1, top_k_anchors)]
-
-                for j in top_k_indices:
-                    s_val = float(row_sims[j])
-                    anc_id = anchors[j].id
-                    scores_per_anchor[anc_id] = s_val
-                    if s_val > best_score:
-                        best_score = s_val
-                        best_anchor_id = anc_id
-                        best_anchor_text = anchors[j].text
-
                 cent_val = float(centroid_sims_batch[idx_in_batch]) if centroid_sims_batch is not None else None
-
                 agg_score = SemanticReferenceSet.aggregate(
                     anchor_sims=scores_per_anchor,
                     strategy=aggregation_strategy,
@@ -438,3 +420,69 @@ def perform_semantic_search(
         batch_size=batch_size,
     )
     return results[:top_k]
+
+
+def compute_per_anchor_statistics(
+    results: List[SearchResult],
+    reference_set: SemanticReferenceSet,
+    threshold: float = 0.50
+) -> Any:
+    """
+    Calcula estatísticas descritivas completas para cada sentença-âncora do conjunto de referência.
+    Retorna um pandas DataFrame com contagens de parágrafos, documentos únicos e métricas descritivas.
+    """
+    import pandas as pd
+    rows = []
+    if not results or not reference_set.anchors:
+        return pd.DataFrame()
+
+    total_paragraphs = len(results)
+    total_docs = len(set(r.article_id for r in results))
+
+    for anchor in reference_set.anchors:
+        anc_id = anchor.id
+        anc_text = anchor.text
+        anc_cat = getattr(anchor, "description", "") or "Geral"
+
+        scores = []
+        doc_ids_at_th = set()
+        p_ids_at_th = set()
+        n_best = 0
+
+        for r in results:
+            s_val = r.anchor_scores.get(anc_id)
+            if s_val is not None:
+                scores.append(s_val)
+                if s_val >= threshold:
+                    doc_ids_at_th.add(r.article_id)
+                    p_ids_at_th.add(r.paragraph_id)
+            if r.best_anchor_id == anc_id:
+                n_best += 1
+
+        if scores:
+            arr = np.array(scores)
+            mean_s = float(np.mean(arr))
+            median_s = float(np.median(arr))
+            min_s = float(np.min(arr))
+            max_s = float(np.max(arr))
+            std_s = float(np.std(arr))
+        else:
+            mean_s = median_s = min_s = max_s = std_s = 0.0
+
+        rows.append({
+            "Âncora ID": anc_id,
+            "Categoria": anc_cat,
+            "Texto da Âncora": anc_text,
+            "Score Médio": round(mean_s, 4),
+            "Score Mediano": round(median_s, 4),
+            "Score Mínimo": round(min_s, 4),
+            "Score Máximo": round(max_s, 4),
+            "Desvio Padrão": round(std_s, 4),
+            "Parágrafos (≥ θ_s)": len(p_ids_at_th),
+            "% Parágrafos": f"{(len(p_ids_at_th) / total_paragraphs * 100):.1f}%" if total_paragraphs > 0 else "0.0%",
+            "Documentos Únicos (≥ θ_s)": len(doc_ids_at_th),
+            "% Documentos Únicos": f"{(len(doc_ids_at_th) / total_docs * 100):.1f}%" if total_docs > 0 else "0.0%",
+            "Melhor Âncora (A*)": n_best
+        })
+
+    return pd.DataFrame(rows)

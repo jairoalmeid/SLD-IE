@@ -295,3 +295,40 @@ def test_7_integrity_checks(tmp_path, sample_corpus_data):
     assert zip_p.exists() and zip_p.stat().st_size > 0
     assert manifest_p.exists()
     assert manifest.indexed_paragraphs == 3
+
+
+def test_8_min_max_score_threshold_filter(tmp_path, sample_corpus_data):
+    """
+    Teste 8 — Filtragem por Limiar Mínimo e Máximo de Similaridade:
+    Garante que os resultados retornados estejam dentro do intervalo [min_score, max_score].
+    """
+    records, embeddings, dim = sample_corpus_data
+    builder = RAGIndexBuilder(output_dir=tmp_path, config=RAGIndexConfig(dimension=dim))
+
+    builder.build(
+        corpus_records=records,
+        embeddings_matrix=embeddings,
+    )
+
+    retriever = RAGIndexRetriever()
+    retriever.load_from_dir(tmp_path / "rag_index")
+
+    mock_emb = MockEmbeddingService(dim=dim)
+
+    # Consulta sem restrições
+    all_res = retriever.query("resiliência de sistemas", embedding_service=mock_emb, top_k=10)
+    assert len(all_res) > 0
+
+    scores = [r.score for r in all_res]
+    median_score = float(np.median(scores))
+
+    # Filtra com min_score acima da mediana
+    filtered_min = retriever.query("resiliência de sistemas", embedding_service=mock_emb, top_k=10, min_score=median_score)
+    for r in filtered_min:
+        assert r.score >= median_score
+
+    # Filtra com max_score abaixo da mediana
+    filtered_max = retriever.query("resiliência de sistemas", embedding_service=mock_emb, top_k=10, max_score=median_score)
+    for r in filtered_max:
+        assert r.score <= median_score
+

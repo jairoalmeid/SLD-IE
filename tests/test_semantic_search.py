@@ -277,3 +277,34 @@ def test_vector_index_invalidation(tmp_path):
     config_v2 = config_v1.copy()
     config_v2["embedding_model"] = "model-v2"
     assert vector_index.is_valid(config_v2) is False
+
+
+def test_compute_per_anchor_statistics(tmp_path):
+    """Testa a geração de estatísticas descritivas individuais por sentença-âncora."""
+    from src.sld.semantic.semantic_search import compute_per_anchor_statistics
+    vector_index, embeddings, segments = _generate_synthetic_corpus(num_paragraphs=50, dim=128)
+
+    emb_service = MockEmbeddingService(dim=128)
+    ref_set = SemanticReferenceSet(
+        anchors=[
+            SemanticAnchor(id="A1", text="Definição de resiliência e adaptação", description="Definição"),
+            SemanticAnchor(id="A2", text="Fatores de vulnerabilidade climática", description="Fator"),
+        ]
+    )
+
+    results = perform_multi_anchor_search(
+        vector_index=vector_index,
+        embedding_service=emb_service,
+        reference_set=ref_set,
+        threshold=0.0,
+        batch_size=20
+    )
+
+    df_stats = compute_per_anchor_statistics(results, ref_set, threshold=0.10)
+    assert not df_stats.empty
+    assert len(df_stats) == 2
+    assert "Âncora ID" in df_stats.columns
+    assert "Documentos Únicos (≥ θ_s)" in df_stats.columns
+    assert "Score Médio" in df_stats.columns
+    assert df_stats.iloc[0]["Âncora ID"] == "A1"
+    assert df_stats.iloc[1]["Âncora ID"] == "A2"

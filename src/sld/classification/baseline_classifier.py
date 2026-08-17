@@ -105,6 +105,14 @@ class MultilabelLogisticClassifier:
         effective_ths = thresholds if thresholds is not None else self.thresholds
         return apply_class_thresholds(probs, effective_ths)
 
+    def predict_with_thresholds(
+        self,
+        X: np.ndarray,
+        thresholds: Optional[Dict[str, float]] = None
+    ) -> np.ndarray:
+        """Aplica thresholds customizados ou ótimos sobre as probabilidades e retorna matriz binária (N, 5)."""
+        return self.predict(X, thresholds=thresholds)
+
     def save(self, output_dir: Path, metadata: Optional[ModelVersionMetadata] = None) -> Path:
         """Salva o modelo, thresholds e metadados de versão em disco."""
         output_path = Path(output_dir).expanduser().resolve()

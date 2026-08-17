@@ -60,26 +60,35 @@ def save_full_session_state(project: AnalysisProject, session_state: Any) -> Dic
             "similarity_threshold": float(snapshot["config"].get("similarity_threshold", 0.50)),
         }
 
-    # 2. Candidatos da Busca Semântica
+    # 2. Candidatos da Busca Semântica e Estatísticas por Sentença-Âncora
     candidates = getattr(session_state, "semantic_candidates", [])
-    if candidates:
-        cand_parquet_path = project.semantic_dir / "candidates.parquet"
+    sem_res_list = getattr(session_state, "semantic_search_results", [])
+    df_anc_to_save = getattr(session_state, "df_anchor_stats", None)
+    if (df_anc_to_save is None or df_anc_to_save.empty) and sem_res_list and getattr(session_state, "reference_set", None):
         try:
-            cand_rows = []
-            for r in candidates:
-                cand_rows.append({
-                    "paragraph_id": r.paragraph_id,
-                    "article_id": r.article_id,
-                    "semantic_score": float(r.semantic_score or 0.0),
-                    "text": r.text,
-                    "status": r.status
-                })
-            df_cand = pd.DataFrame(cand_rows)
-            df_cand.to_parquet(cand_parquet_path, index=False)
-            snapshot["semantic_candidates_file"] = str(cand_parquet_path.relative_to(project.output_dir))
+            from src.sld.semantic.semantic_search import compute_per_anchor_statistics
+            df_anc_to_save = compute_per_anchor_statistics(
+                results=sem_res_list,
+                reference_set=session_state.reference_set,
+                threshold=float(snapshot["config"].get("similarity_threshold", 0.50))
+            )
+            session_state.df_anchor_stats = df_anc_to_save
+        except Exception as e:
+            logger.warning(f"Erro ao computar estatísticas de âncoras para persistência: {e}")
+
+    if candidates or (df_anc_to_save is not None and not df_anc_to_save.empty):
+        try:
+            cand_paths = export_semantic_candidates_to_disk(
+                project=project,
+                candidates=candidates,
+                run_id=snapshot.get("run_id", "default"),
+                df_anchor_stats=df_anc_to_save
+            )
+            if "parquet" in cand_paths:
+                snapshot["semantic_candidates_file"] = str(cand_paths["parquet"].relative_to(project.output_dir))
             snapshot["semantic_candidates_count"] = len(candidates)
         except Exception as e:
-            logger.warning(f"Erro ao salvar candidates.parquet: {e}")
+            logger.warning(f"Erro ao salvar arquivos de busca semântica no disco: {e}")
 
     # 3. Gold Standard e Anotações
     gold_annotations = getattr(session_state, "gold_annotations", [])
@@ -91,7 +100,7 @@ def save_full_session_state(project: AnalysisProject, session_state: Any) -> Dic
         except Exception as e:
             logger.warning(f"Erro ao persistir gold standard no projeto: {e}")
 
-    # 4. Modelo de Classificação Supervisionada
+    # 4. Modelo de Classificação Supervisionada e Relatório de Avaliação
     clf = getattr(session_state, "logistic_classifier", None)
     if clf is not None and getattr(clf, "is_fitted", False):
         try:
@@ -99,6 +108,14 @@ def save_full_session_state(project: AnalysisProject, session_state: Any) -> Dic
             snapshot["has_trained_model"] = True
         except Exception as e:
             logger.warning(f"Erro ao salvar classificador supervisionado: {e}")
+
+    eval_rep = getattr(session_state, "evaluation_report", None)
+    if eval_rep is not None:
+        try:
+            export_evaluation_report_to_disk(project, eval_rep, snapshot.get("run_id", "default"))
+            snapshot["has_evaluation_report"] = True
+        except Exception as e:
+            logger.warning(f"Erro ao salvar relatórios de avaliação no disco: {e}")
 
     opt_thresh = getattr(session_state, "optimal_thresholds", None)
     if opt_thresh:
@@ -108,25 +125,17 @@ def save_full_session_state(project: AnalysisProject, session_state: Any) -> Dic
     # 5. Corpus Classificado Conceitualmente
     classified = getattr(session_state, "classified_records", [])
     if classified:
-        class_parquet_path = project.classification_dir / "classified_corpus.parquet"
         try:
-            class_rows = []
-            for r in classified:
-                class_rows.append({
-                    "paragraph_id": r.paragraph_id,
-                    "article_id": r.article_id,
-                    "status": r.status,
-                    "semantic_score": float(r.semantic_score or 0.0),
-                    "predicted_labels": json.dumps(r.predicted_labels or []),
-                    "predicted_probabilities": json.dumps(r.predicted_probabilities or {}),
-                    "text": r.text
-                })
-            df_class = pd.DataFrame(class_rows)
-            df_class.to_parquet(class_parquet_path, index=False)
-            snapshot["classified_corpus_file"] = str(class_parquet_path.relative_to(project.output_dir))
+            class_paths = export_classified_corpus_to_disk(
+                project=project,
+                classified_records=classified,
+                run_id=snapshot.get("run_id", "default")
+            )
+            if "parquet" in class_paths:
+                snapshot["classified_corpus_file"] = str(class_paths["parquet"].relative_to(project.output_dir))
             snapshot["classified_records_count"] = len(classified)
         except Exception as e:
-            logger.warning(f"Erro ao salvar classified_corpus.parquet: {e}")
+            logger.warning(f"Erro ao salvar arquivos de corpus classificado no disco: {e}")
 
     # 6. Metadados do Índice RAG
     rag_stats = getattr(session_state, "rag_index_stats", None)
@@ -146,6 +155,263 @@ def save_full_session_state(project: AnalysisProject, session_state: Any) -> Dic
     gc.collect()
 
     return snapshot
+
+
+def export_classified_corpus_to_disk(
+    project: AnalysisProject,
+    classified_records: List[Any],
+    run_id: str = "default"
+) -> Dict[str, Path]:
+    """
+    Exporta e persiste o corpus classificado em múltiplos formatos físicos no disco:
+    - classified_corpus.parquet (alta performance colunar)
+    - classified_corpus.csv (compatível com Excel, SPSS, R, Python)
+    - classified_corpus.jsonl (para LLMs e pipelines de NLP)
+    - classified_corpus.md (Markdown estruturado para consulta)
+    """
+    out_paths: Dict[str, Path] = {}
+    if not classified_records:
+        return out_paths
+
+    target_dir = project.classification_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Salva Parquet diretamente em formato colunar de alta velocidade
+    col_p_id = [getattr(r, "paragraph_id", "") for r in classified_records]
+    col_a_id = [getattr(r, "article_id", "") for r in classified_records]
+    col_status = [getattr(r, "status", "") for r in classified_records]
+    col_sem_score = [float(getattr(r, "semantic_score", 0.0) or 0.0) for r in classified_records]
+    col_pred_labels = [json.dumps(getattr(r, "predicted_labels", []) or []) for r in classified_records]
+    col_pred_probs = [json.dumps(getattr(r, "predicted_probabilities", {}) or {}) for r in classified_records]
+    col_text = [getattr(r, "text", "") for r in classified_records]
+
+    df_parquet = pd.DataFrame({
+        "paragraph_id": col_p_id,
+        "article_id": col_a_id,
+        "status": col_status,
+        "semantic_score": col_sem_score,
+        "predicted_labels": col_pred_labels,
+        "predicted_probabilities": col_pred_probs,
+        "text": col_text
+    })
+    pq_p = target_dir / "classified_corpus.parquet"
+    df_parquet.to_parquet(pq_p, index=False)
+    out_paths["parquet"] = pq_p
+    del df_parquet, col_pred_labels, col_pred_probs
+    gc.collect()
+
+    # 2. Salva CSV
+    col_labels_str = [", ".join(getattr(r, "predicted_labels", []) or []) if getattr(r, "predicted_labels", None) else "Nenhum" for r in classified_records]
+    col_max_prob = [round(float(max((getattr(r, "predicted_probabilities", {}) or {}).values())), 4) if getattr(r, "predicted_probabilities", None) else 0.0 for r in classified_records]
+
+    df_csv = pd.DataFrame({
+        "paragraph_id": col_p_id,
+        "article_id": col_a_id,
+        "status": col_status,
+        "semantic_score": [round(s, 4) for s in col_sem_score],
+        "predicted_labels": col_labels_str,
+        "max_probability": col_max_prob,
+        "text": col_text
+    })
+    csv_p = target_dir / "classified_corpus.csv"
+    df_csv.to_csv(csv_p, index=False, encoding="utf-8")
+    out_paths["csv"] = csv_p
+    del df_csv, col_p_id, col_a_id, col_status, col_sem_score, col_labels_str, col_max_prob, col_text
+    gc.collect()
+
+    # 3. Salva JSONL por streaming direto
+    jsonl_p = target_dir / "classified_corpus.jsonl"
+    with open(jsonl_p, "w", encoding="utf-8") as f:
+        for r in classified_records:
+            f.write(json.dumps({
+                "paragraph_id": getattr(r, "paragraph_id", ""),
+                "article_id": getattr(r, "article_id", ""),
+                "status": getattr(r, "status", ""),
+                "semantic_score": float(getattr(r, "semantic_score", 0.0) or 0.0),
+                "predicted_labels": getattr(r, "predicted_labels", []) or [],
+                "predicted_probabilities": getattr(r, "predicted_probabilities", {}) or {},
+                "text": getattr(r, "text", "")
+            }, ensure_ascii=False) + "\n")
+    out_paths["jsonl"] = jsonl_p
+
+    # 4. Salva Markdown por streaming direto
+    md_p = target_dir / "classified_corpus.md"
+    with open(md_p, "w", encoding="utf-8") as f:
+        f.write(f"# Corpus Final Classificado — SLD ({run_id})\n\n")
+        f.write(f"- **Data/Hora de Geração:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"- **Total de Parágrafos:** {len(classified_records):,}\n".replace(",", "."))
+        f.write(f"- **Total de Artigos Representados:** {len(set(getattr(r, 'article_id', '') for r in classified_records)):,}\n\n---\n\n".replace(",", "."))
+        for r in classified_records:
+            probs_str = json.dumps(getattr(r, "predicted_probabilities", {}))
+            f.write(f"## Parágrafo `{getattr(r, 'paragraph_id', '')}` (`{getattr(r, 'article_id', '')}`)\n")
+            f.write(f"- **Status:** `{getattr(r, 'status', '')}`\n")
+            f.write(f"- **Similaridade Cosseno:** `{getattr(r, 'semantic_score', 0.0) or 0.0:.4f}`\n")
+            f.write(f"- **Classes Preditas:** `{', '.join(getattr(r, 'predicted_labels', []) or ['Nenhum'])}`\n")
+            f.write(f"- **Probabilidades:** `{probs_str}`\n\n")
+            f.write(f"{getattr(r, 'text', '')}\n\n---\n\n")
+    out_paths["md"] = md_p
+    out_paths["md"] = md_p
+
+    return out_paths
+
+
+def export_anchor_statistics_to_disk(
+    project: AnalysisProject,
+    df_anchor_stats: pd.DataFrame,
+    run_id: str = "default"
+) -> Dict[str, Path]:
+    """
+    Exporta a tabela descritiva detalhada por sentença-âncora em CSV, Parquet e Markdown.
+    """
+    out_paths: Dict[str, Path] = {}
+    if df_anchor_stats is None or df_anchor_stats.empty:
+        return out_paths
+
+    target_dir = project.semantic_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. CSV
+    csv_p = target_dir / "estatisticas_ancoras.csv"
+    df_anchor_stats.to_csv(csv_p, index=False, encoding="utf-8")
+    out_paths["csv"] = csv_p
+
+    # 2. Parquet
+    pq_p = target_dir / "estatisticas_ancoras.parquet"
+    df_anchor_stats.to_parquet(pq_p, index=False)
+    out_paths["parquet"] = pq_p
+
+    # 3. Markdown
+    md_p = target_dir / "estatisticas_ancoras.md"
+    with open(md_p, "w", encoding="utf-8") as f:
+        f.write(f"# Estatísticas Detalhadas por Sentença-Âncora — SLD ({run_id})\n\n")
+        f.write(f"- **Data/Hora de Geração:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"- **Total de Âncoras Analisadas:** {len(df_anchor_stats)}\n\n---\n\n")
+        f.write(df_anchor_stats.to_markdown(index=False))
+        f.write("\n\n---\n\n")
+    out_paths["md"] = md_p
+
+    return out_paths
+
+
+def export_semantic_candidates_to_disk(
+    project: AnalysisProject,
+    candidates: List[Any],
+    run_id: str = "default",
+    df_anchor_stats: Optional[pd.DataFrame] = None
+) -> Dict[str, Path]:
+    """
+    Exporta os candidatos da busca semântica em CSV, Parquet, JSONL e Markdown no disco,
+    além das estatísticas por sentença-âncora se fornecidas.
+    """
+    out_paths: Dict[str, Path] = {}
+    target_dir = project.semantic_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    if candidates:
+        cand_rows = [{
+            "paragraph_id": getattr(r, "paragraph_id", ""),
+            "article_id": getattr(r, "article_id", ""),
+            "semantic_score": round(float(getattr(r, "semantic_score", 0.0) or 0.0), 4),
+            "status": getattr(r, "status", ""),
+            "text": getattr(r, "text", "")
+        } for r in candidates]
+
+        df_cand = pd.DataFrame(cand_rows)
+
+        # 1. CSV
+        csv_p = target_dir / "candidates.csv"
+        df_cand.to_csv(csv_p, index=False, encoding="utf-8")
+        out_paths["csv"] = csv_p
+
+        # 2. Parquet
+        pq_p = target_dir / "candidates.parquet"
+        df_cand.to_parquet(pq_p, index=False)
+        out_paths["parquet"] = pq_p
+
+        # 3. JSONL
+        jsonl_p = target_dir / "candidates.jsonl"
+        with open(jsonl_p, "w", encoding="utf-8") as f:
+            for r in candidates:
+                f.write(json.dumps({
+                    "paragraph_id": getattr(r, "paragraph_id", ""),
+                    "article_id": getattr(r, "article_id", ""),
+                    "semantic_score": float(getattr(r, "semantic_score", 0.0) or 0.0),
+                    "status": getattr(r, "status", ""),
+                    "text": getattr(r, "text", "")
+                }, ensure_ascii=False) + "\n")
+        out_paths["jsonl"] = jsonl_p
+
+        # 4. Markdown
+        md_p = target_dir / "candidates.md"
+        with open(md_p, "w", encoding="utf-8") as f:
+            f.write(f"# Candidatos por Similaridade Semântica — SLD ({run_id})\n\n")
+            f.write(f"- **Data/Hora:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"- **Total de Candidatos:** {len(candidates):,}\n\n---\n\n".replace(",", "."))
+            for r in candidates:
+                f.write(f"## Parágrafo `{getattr(r, 'paragraph_id', '')}` (`{getattr(r, 'article_id', '')}`)\n")
+                f.write(f"- **Score Cosseno:** `{getattr(r, 'semantic_score', 0.0) or 0.0:.4f}`\n\n")
+                f.write(f"{getattr(r, 'text', '')}\n\n---\n\n")
+        out_paths["md"] = md_p
+
+    if df_anchor_stats is not None and not df_anchor_stats.empty:
+        anc_paths = export_anchor_statistics_to_disk(project, df_anchor_stats, run_id=run_id)
+        out_paths.update(anc_paths)
+
+    return out_paths
+
+
+def export_evaluation_report_to_disk(
+    project: AnalysisProject,
+    report: Any,
+    run_id: str = "default"
+) -> Dict[str, Path]:
+    """
+    Salva fisicamente no disco os relatórios de avaliação supervisionada:
+    - metricas_avaliacao_globais.csv
+    - metricas_avaliacao_classes.csv
+    - diagnostico_classe_0.csv
+    - variacao_folds_cv.csv (se aplicável)
+    - relatorio_avaliacao.md
+    """
+    from src.sld.evaluation.multilabel_evaluator import generate_evaluation_tables, generate_evaluation_markdown
+    out_paths: Dict[str, Path] = {}
+    if report is None:
+        return out_paths
+
+    target_dir = project.classification_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    df_g, df_c, df_c0, df_cv = generate_evaluation_tables(report)
+    md_text = generate_evaluation_markdown(report)
+
+    # 1. Global
+    p_g = target_dir / "metricas_avaliacao_globais.csv"
+    df_g.to_csv(p_g, index=False, encoding="utf-8")
+    out_paths["global_csv"] = p_g
+
+    # 2. Classes
+    p_c = target_dir / "metricas_avaliacao_classes.csv"
+    df_c.to_csv(p_c, index=False, encoding="utf-8")
+    out_paths["classes_csv"] = p_c
+
+    # 3. Diagnóstico Classe 0
+    if df_c0 is not None and not df_c0.empty:
+        p_c0 = target_dir / "diagnostico_classe_0.csv"
+        df_c0.to_csv(p_c0, index=False, encoding="utf-8")
+        out_paths["class_0_csv"] = p_c0
+
+    # 4. Validação Cruzada (se houver)
+    if df_cv is not None and not df_cv.empty:
+        p_cv = target_dir / "variacao_folds_cv.csv"
+        df_cv.to_csv(p_cv, index=False, encoding="utf-8")
+        out_paths["cv_csv"] = p_cv
+
+    # 5. Markdown
+    p_md = target_dir / "relatorio_avaliacao.md"
+    p_md.write_text(md_text, encoding="utf-8")
+    out_paths["report_md"] = p_md
+
+    return out_paths
 
 
 def restore_full_session_state(project: AnalysisProject, session_state: Any) -> Dict[str, Any]:
@@ -400,8 +666,27 @@ def restore_full_session_state(project: AnalysisProject, session_state: Any) -> 
             class_list = []
             class_map = {}
             for _, row in df_class.iterrows():
-                lbls = json.loads(row["predicted_labels"]) if isinstance(row["predicted_labels"], str) else list(row["predicted_labels"])
-                probs = json.loads(row["predicted_probabilities"]) if isinstance(row["predicted_probabilities"], str) else dict(row["predicted_probabilities"])
+                lbls_raw = row.get("predicted_labels", [])
+                if isinstance(lbls_raw, str):
+                    try:
+                        lbls = json.loads(lbls_raw)
+                    except Exception:
+                        lbls = [x.strip() for x in lbls_raw.split(",") if x.strip() and x.strip() != "Nenhum"]
+                elif isinstance(lbls_raw, (list, tuple, np.ndarray)):
+                    lbls = list(lbls_raw)
+                else:
+                    lbls = []
+
+                probs_raw = row.get("predicted_probabilities", {})
+                if isinstance(probs_raw, str):
+                    try:
+                        probs = json.loads(probs_raw)
+                    except Exception:
+                        probs = {}
+                elif isinstance(probs_raw, dict):
+                    probs = dict(probs_raw)
+                else:
+                    probs = {}
                 p_rec = ParagraphRecord(
                     paragraph_id=str(row["paragraph_id"]),
                     article_id=str(row["article_id"]),

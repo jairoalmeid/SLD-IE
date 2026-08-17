@@ -211,7 +211,14 @@ class RAGIndexBuilder:
         raw_dim = embeddings_matrix.shape[1]
         self.config.dimension = raw_dim
 
-        # 3. Inicialização do Índice FAISS
+        # 3. Inicialização do Índice FAISS com suporte a multi-threading
+        # Configura número de threads OMP para aceleração em CPUs multicore (Apple Silicon M4/Air)
+        try:
+            num_cpus = os.cpu_count() or 4
+            faiss.omp_set_num_threads(num_cpus)
+        except Exception:
+            pass
+
         # Métricas: METRIC_INNER_PRODUCT equivale a Cosine Similarity quando normalizado L2
         metric = faiss.METRIC_INNER_PRODUCT if self.config.metric == "inner_product" else faiss.METRIC_L2
 
@@ -244,10 +251,30 @@ class RAGIndexBuilder:
 
             if progress_callback:
                 progress_callback(b_end, num_records, f"Indexando lote {b_idx + 1}/{num_batches} ({b_end:,} de {num_records:,} vetores)")
+            time.sleep(0.001)
 
-        # 5. Construção dos Metadados Parquet
-        meta_rows = []
+        # 5. Construção dos Metadados Parquet em memória compacta
         class_counts = {"definition": 0, "determinant": 0, "type_dimension": 0, "causal_relation": 0, "property": 0}
+
+        col_faiss_id = []
+        col_paragraph_id = []
+        col_document_id = []
+        col_article_id = []
+        col_section = []
+        col_text = []
+        col_embedding_row = []
+        col_class_1 = []
+        col_class_2 = []
+        col_class_3 = []
+        col_class_4 = []
+        col_class_5 = []
+        col_semantic_similarity = []
+        col_title = []
+        col_authors = []
+        col_year = []
+        col_doi = []
+        col_source_file = []
+        col_markdown_file = []
 
         for faiss_id, r in enumerate(refined_records):
             preds = set(r.predicted_labels or [])
@@ -268,29 +295,53 @@ class RAGIndexBuilder:
             if c5:
                 class_counts["property"] += 1
 
-            meta_rows.append({
-                "faiss_id": int(faiss_id),
-                "paragraph_id": str(r.paragraph_id),
-                "document_id": str(r.article_id),
-                "article_id": str(r.article_id),
-                "section": str(getattr(r, "section", "") or ""),
-                "text": str(r.text),
-                "embedding_row": int(selected_matrix_indices[faiss_id]),
-                "class_1": bool(c1),
-                "class_2": bool(c2),
-                "class_3": bool(c3),
-                "class_4": bool(c4),
-                "class_5": bool(c5),
-                "semantic_similarity": float(r.semantic_score or 0.0),
-                "title": str(getattr(r, "title", "") or ""),
-                "authors": str(getattr(r, "authors", "") or ""),
-                "year": str(getattr(r, "year", "") or ""),
-                "doi": str(getattr(r, "doi", "") or ""),
-                "source_file": str(getattr(r, "source_pdf", "") or ""),
-                "markdown_file": str(getattr(r, "markdown_path", "") or ""),
-            })
+            col_faiss_id.append(int(faiss_id))
+            col_paragraph_id.append(str(r.paragraph_id))
+            doc_id_str = str(r.article_id)
+            col_document_id.append(doc_id_str)
+            col_article_id.append(doc_id_str)
+            col_section.append(str(getattr(r, "section", "") or ""))
+            col_text.append(str(r.text))
+            col_embedding_row.append(int(selected_matrix_indices[faiss_id]))
+            col_class_1.append(c1)
+            col_class_2.append(c2)
+            col_class_3.append(c3)
+            col_class_4.append(c4)
+            col_class_5.append(c5)
+            col_semantic_similarity.append(float(r.semantic_score or 0.0))
+            col_title.append(str(getattr(r, "title", "") or ""))
+            col_authors.append(str(getattr(r, "authors", "") or ""))
+            col_year.append(str(getattr(r, "year", "") or ""))
+            col_doi.append(str(getattr(r, "doi", "") or ""))
+            col_source_file.append(str(getattr(r, "source_pdf", "") or ""))
+            col_markdown_file.append(str(getattr(r, "markdown_path", "") or ""))
 
-        df_metadata = pd.DataFrame(meta_rows)
+        df_metadata = pd.DataFrame({
+            "faiss_id": col_faiss_id,
+            "paragraph_id": col_paragraph_id,
+            "document_id": col_document_id,
+            "article_id": col_article_id,
+            "section": col_section,
+            "text": col_text,
+            "embedding_row": col_embedding_row,
+            "class_1": col_class_1,
+            "class_2": col_class_2,
+            "class_3": col_class_3,
+            "class_4": col_class_4,
+            "class_5": col_class_5,
+            "semantic_similarity": col_semantic_similarity,
+            "title": col_title,
+            "authors": col_authors,
+            "year": col_year,
+            "doi": col_doi,
+            "source_file": col_source_file,
+            "markdown_file": col_markdown_file,
+        })
+
+        del col_faiss_id, col_paragraph_id, col_document_id, col_article_id, col_section, col_text
+        del col_embedding_row, col_class_1, col_class_2, col_class_3, col_class_4, col_class_5
+        del col_semantic_similarity, col_title, col_authors, col_year, col_doi, col_source_file, col_markdown_file
+        import gc; gc.collect()
 
         # 6. Criação dos diretórios de saída
         target_dir = self.output_dir if self.output_dir.name == "rag_index" else (self.output_dir / "rag_index")
@@ -306,24 +357,25 @@ class RAGIndexBuilder:
         # 7. Persistência dos arquivos
         faiss.write_index(faiss_index, str(faiss_path))
         df_metadata.to_parquet(parquet_path, engine="pyarrow", index=False)
+        del df_metadata
+        gc.collect()
 
-        # 8. Validação rigorosa de integridade
-        test_index = faiss.read_index(str(faiss_path))
-        if test_index.ntotal != num_records:
+        # 8. Validação rigorosa de integridade (sem carregar toda a tabela novamente na RAM)
+        if faiss_index.ntotal != num_records:
             raise RuntimeError(
-                f"Falha de integridade: faiss.ntotal ({test_index.ntotal}) difere do número de parágrafos ({num_records})."
+                f"Falha de integridade: faiss.ntotal ({faiss_index.ntotal}) difere do número de parágrafos ({num_records})."
             )
 
-        test_table = pq.read_table(parquet_path)
-        if test_table.num_rows != num_records:
+        pq_file_meta = pq.ParquetFile(parquet_path).metadata
+        if pq_file_meta.num_rows != num_records:
             raise RuntimeError(
-                f"Falha de integridade: metadata.parquet ({test_table.num_rows}) difere do número de vetores ({num_records})."
+                f"Falha de integridade: metadata.parquet ({pq_file_meta.num_rows}) difere do número de vetores ({num_records})."
             )
 
         # Executa pequeno teste de consulta operacional
         dummy_query = np.ones((1, self.config.dimension), dtype=np.float32)
         dummy_query /= np.linalg.norm(dummy_query)
-        _, test_ids = test_index.search(dummy_query, min(5, num_records))
+        _, test_ids = faiss_index.search(dummy_query, min(5, num_records))
         if test_ids.shape[1] == 0 or test_ids[0][0] < 0:
             raise RuntimeError("Falha no teste operacional de consulta ao índice recarregado.")
 
@@ -476,12 +528,12 @@ metadata = pd.read_parquet("metadata.parquet")
         with open(readme_path, "w", encoding="utf-8") as f:
             f.write(readme_md)
 
-        # 14. Empacotamento em arquivo ZIP
+        # 14. Empacotamento em arquivo ZIP (usando ZIP_STORED para empacotamento instantâneo de alta performance sem travamento de CPU)
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         zip_name = f"rag_index_{index_version}_{timestamp_str}.zip"
         zip_path = target_dir / zip_name
 
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
             zf.write(faiss_path, arcname=f"rag_index_{index_version}/corpus_refinado.faiss")
             zf.write(parquet_path, arcname=f"rag_index_{index_version}/metadata.parquet")
             zf.write(manifest_path, arcname=f"rag_index_{index_version}/manifest.json")

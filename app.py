@@ -6,6 +6,7 @@ Refatoração Visual de Alta Sobriedade Acadêmica e Download em Todas as Etapas
 
 import time
 import json
+import logging
 from pathlib import Path
 from datetime import datetime
 import numpy as np
@@ -13,6 +14,8 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+
+logger = logging.getLogger(__name__)
 
 from config.settings import (
     BASE_DIR,
@@ -45,7 +48,7 @@ from src.sld.ingestion.markdown_writer import write_markdown_file, generate_mark
 from src.sld.ingestion.segmenter import segment_markdown_paragraphs
 from src.sld.semantic.embedding_service import EmbeddingService
 from src.sld.semantic.semantic_reference import SemanticReferenceSet
-from src.sld.semantic.semantic_search import perform_multi_anchor_search, perform_semantic_search
+from src.sld.semantic.semantic_search import perform_multi_anchor_search, perform_semantic_search, compute_per_anchor_statistics
 from src.sld.analysis.corpus_analysis import (
     compute_corpus_descriptors,
     compute_top_terms,
@@ -55,8 +58,19 @@ from src.sld.analysis.corpus_analysis import (
 from src.sld.classification.baseline_classifier import MultilabelLogisticClassifier
 from src.sld.annotation.active_learning_sampling import sample_paragraphs
 from src.sld.evaluation.group_splitter import split_annotations_by_article, verify_no_data_leakage
-from src.sld.evaluation.multilabel_evaluator import compute_multilabel_evaluation, compute_pr_curves_data
+from src.sld.evaluation.multilabel_evaluator import (
+    compute_multilabel_evaluation,
+    compute_pr_curves_data,
+    generate_evaluation_tables,
+    generate_evaluation_markdown
+)
 from src.sld.evaluation.inter_annotator_agreement import compute_inter_annotator_agreement
+from src.sld.models.concept_label import (
+    MULTILABEL_CLASSES,
+    CONCEPT_LABEL_NAMES,
+    CONCEPT_LABEL_SHORT_NAMES
+)
+from src.sld.models.classification import EvaluationReport
 from src.sld.annotation.annotation_service import AnnotationService
 from src.sld.corpus.corpus_repository import CorpusRepository
 from src.sld.models.llm_extraction import ExtractionOutput, LLMParagraphResult
@@ -100,7 +114,15 @@ from src.sld.rag_index import (
     compute_corpus_distribution_stats,
     compute_coverage_stats,
 )
-from src.sld.corpus.session_manager import save_full_session_state, restore_full_session_state, inspect_stage_files
+from src.sld.corpus.session_manager import (
+    save_full_session_state,
+    restore_full_session_state,
+    inspect_stage_files,
+    export_classified_corpus_to_disk,
+    export_semantic_candidates_to_disk,
+    export_anchor_statistics_to_disk,
+    export_evaluation_report_to_disk
+)
 from src.sld.reports.methodology_report import generate_methodology_report
 
 
@@ -173,6 +195,12 @@ if "active_sampling_batch" not in st.session_state:
 if "current_uncertain_samples" not in st.session_state:
     st.session_state.current_uncertain_samples = []
 
+if "optimal_thresholds" not in st.session_state:
+    st.session_state.optimal_thresholds = None
+
+if "evaluation_report" not in st.session_state:
+    st.session_state.evaluation_report = None
+
 if "eval_report" not in st.session_state:
     st.session_state.eval_report = None
 
@@ -220,6 +248,214 @@ def sync_project_state(output_dir_path: Path):
     # Executa restauração completa desacoplada de tudo que estiver no disco
     res_info = restore_full_session_state(project, st.session_state)
     return res_info
+
+
+def render_supervised_evaluation_panel(
+    eval_report: EvaluationReport,
+    project: AnalysisProject,
+    run_id: str,
+    key_suffix: str = "main"
+):
+    """
+    Renderiza painel quantitativo e metodológico de avaliação supervisionada com:
+    - Alertas de Integridade e Vazamento de Dados (Data Leakage)
+    - Métricas Globais das Classes Ativas 1 a 5 (Macro/Micro F1 com IC95% Bootstrap)
+    - Tabela Principal das 5 Classes Ativas (com suporte positivo, prevalência, especificidade, IC95%, AP e ROC-AUC)
+    - Diagnóstico Separado da Classe 0 (Não Relevante — Derivada e Excludente)
+    - Variação da Validação Cruzada (se houver)
+    - Gráficos Comparativos Plotly e Matrizes de Confusão 2×2
+    - Persistência em Disco e Botões de Download
+    """
+    df_g, df_c, df_c0, df_cv = generate_evaluation_tables(eval_report)
+    md_text = generate_evaluation_markdown(eval_report)
+
+    # 1. Alertas de Integridade Metodológica e Vazamento de Dados
+    if eval_report.methodological_alerts:
+        for alert in eval_report.methodological_alerts:
+            if "🚨" in alert or "❌" in alert:
+                st.error(alert)
+            elif "⚠️" in alert:
+                st.warning(alert)
+            else:
+                st.info(alert)
+
+    # 2. Métricas Globais das Classes Ativas (1 a 5)
+    st.markdown("#### 🎯 Métricas Globais das Classes Ativas (1 a 5)")
+    st.caption("As métricas agregadas principais são computadas estritamente sobre as 5 classes ativas.")
+
+    col_m1, col_m2, col_m3, col_m4, col_m5, col_m6 = st.columns(6)
+    m_f1_str = f"{eval_report.macro_f1:.4f}" if eval_report.macro_f1 is not None else "N/A"
+    if eval_report.macro_f1_ci95:
+        m_f1_help = f"Macro-F1: Média não ponderada do F1 das classes ativas (IC 95%: [{eval_report.macro_f1_ci95[0]:.4f}, {eval_report.macro_f1_ci95[1]:.4f}])."
+    else:
+        m_f1_help = "Macro-F1: Média não ponderada do F1 das classes ativas."
+    col_m1.metric("Macro-F1", m_f1_str, help=m_f1_help)
+
+    mic_f1_str = f"{eval_report.micro_f1:.4f}" if eval_report.micro_f1 is not None else "N/A"
+    col_m2.metric("Micro-F1", mic_f1_str, help="F1 global calculado a partir da soma agregada de TP, FP e FN.")
+
+    m_p_str = f"{eval_report.macro_precision:.4f}" if eval_report.macro_precision is not None else "N/A"
+    col_m3.metric("Macro-Precision", m_p_str, help="Média das taxas de precisão positiva entre as classes 1 a 5.")
+
+    m_r_str = f"{eval_report.macro_recall:.4f}" if eval_report.macro_recall is not None else "N/A"
+    col_m4.metric("Macro-Recall", m_r_str, help="Média das taxas de sensibilidade/recuperação entre as classes 1 a 5.")
+
+    em_str = f"{eval_report.subset_accuracy:.4f}"
+    col_m5.metric("Exact Match", em_str, help="Subset Accuracy: % de parágrafos com acerto em todas as 5 classes.")
+
+    hl_str = f"{eval_report.hamming_loss:.4f}"
+    col_m6.metric("Hamming Loss", hl_str, help="Fração de decisões binárias individuais incorretas.")
+
+    col_meta1, col_meta2 = st.columns(2)
+    col_meta1.caption(f"📊 **Cardinalidade de Rótulos ($LC$):** `{eval_report.label_cardinality:.4f}` rótulos/parágrafo")
+    col_meta2.caption(f"📈 **Densidade de Rótulos ($LD$):** `{eval_report.label_density:.4f}`")
+
+    with st.expander("📋 Tabela Estruturada de Métricas Globais", expanded=False):
+        st.dataframe(df_g, use_container_width=True)
+
+    st.divider()
+
+    # 3. Tabela Principal de Desempenho das Classes Ativas (1 a 5)
+    st.markdown("#### 🏷️ Desempenho Detalhado por Dimensão Conceitual (Classes Ativas 1 a 5)")
+    st.caption("Tabela com limiares calibrados, prevalência, suporte, matriz de confusão e métricas discriminativas.")
+    st.dataframe(df_c, use_container_width=True)
+
+    # 4. Seção Separada: Diagnóstico da Classe 0 (Não Relevante)
+    st.divider()
+    st.markdown("#### 🚫 Diagnóstico Isolado da Classe 0 (Não Relevante — Derivada)")
+    st.caption("A Classe 0 é obtida por exclusão lógica mútua (quando nenhuma das classes ativas 1 a 5 é atribuída).")
+    if df_c0 is not None and not df_c0.empty:
+        st.dataframe(df_c0, use_container_width=True)
+    if eval_report.class_0_metrics and eval_report.class_0_metrics.support_positive == 0:
+        st.info(f"ℹ️ **Nota Metodológica:** {eval_report.class_0_metrics.note}")
+
+    # 5. Tabela de Validação Cruzada (se houver)
+    if df_cv is not None and not df_cv.empty:
+        st.divider()
+        st.markdown("#### 🔄 Variação entre Folds da Validação Cruzada (K-Fold CV)")
+        st.dataframe(df_cv, use_container_width=True)
+
+    st.divider()
+
+    # 6. Gráficos Comparativos (Plotly)
+    col_plot1, col_plot2 = st.columns(2)
+    with col_plot1:
+        df_c_plot = df_c.copy()
+        try:
+            df_c_plot["Precisão"] = pd.to_numeric(df_c_plot["Precisão"], errors="coerce")
+            df_c_plot["Recall"] = pd.to_numeric(df_c_plot["Recall"], errors="coerce")
+            df_c_plot["F1"] = pd.to_numeric(df_c_plot["F1"], errors="coerce")
+
+            fig_bar = px.bar(
+                df_c_plot,
+                x="Classe",
+                y=["Precisão", "Recall", "F1"],
+                barmode="group",
+                hover_data=["Dimensão", "Suporte positivo", "TP", "FP", "FN", "TN"],
+                title="Comparativo de Precisão, Recall e F1 por Classe",
+                labels={"value": "Score (0 a 1)", "variable": "Métrica"}
+            )
+            fig_bar.update_layout(yaxis=dict(range=[0, 1.05]), legend_title_text="Métrica")
+            st.plotly_chart(fig_bar, use_container_width=True)
+        except Exception:
+            pass
+
+    with col_plot2:
+        try:
+            fig_sup = px.bar(
+                df_c,
+                x="Classe",
+                y=["TP", "FP", "FN"],
+                barmode="group",
+                hover_data=["Dimensão", "Suporte positivo"],
+                title="Distribuição de Contagens (TP, FP, FN) por Dimensão",
+                labels={"value": "Quantidade de Parágrafos", "variable": "Decisão"}
+            )
+            fig_sup.update_layout(legend_title_text="Contagem")
+            st.plotly_chart(fig_sup, use_container_width=True)
+        except Exception:
+            pass
+
+    st.divider()
+
+    # 7. Matrizes de Confusão Binárias 2x2 por Classe
+    st.markdown("#### 🔲 Matrizes de Confusão Binárias 2×2 por Dimensão Conceitual")
+    matrix_classes = [c for c in MULTILABEL_CLASSES if CONCEPT_LABEL_SHORT_NAMES[c] in eval_report.per_class_metrics]
+    for i in range(0, len(matrix_classes), 2):
+        cols_cm = st.columns(2)
+        for j in range(2):
+            if i + j < len(matrix_classes):
+                c_idx = matrix_classes[i + j]
+                c_s = CONCEPT_LABEL_SHORT_NAMES[c_idx]
+                m_info = eval_report.per_class_metrics[c_s]
+                tp, fp, fn, tn = m_info.true_positives, m_info.false_positives, m_info.false_negatives, m_info.true_negatives
+                total_k = tp + fp + fn + tn
+                acc_k = (tp + tn) / max(1, total_k)
+                fpr_k = (fp / max(1, fp + tn)) if (fp + tn) > 0 else 0.0
+                fnr_k = (fn / max(1, fn + tp)) if (fn + tp) > 0 else 0.0
+
+                with cols_cm[j]:
+                    st.markdown(f"**Classe {c_idx} — {CONCEPT_LABEL_NAMES[c_idx]}**")
+                    df_cm_display = pd.DataFrame(
+                        [
+                            {"Predição": "Previsto Positivo (+)", "Real Positivo (1)": f"TP = {tp}", "Real Negativo (0)": f"FP = {fp}"},
+                            {"Predição": "Previsto Negativo (-)", "Real Positivo (1)": f"FN = {fn}", "Real Negativo (0)": f"TN = {tn}"}
+                        ]
+                    )
+                    st.dataframe(df_cm_display, use_container_width=True, hide_index=True)
+                    st.caption(f"✓ Acurácia Binária: `{acc_k:.2%}` | Taxa FP (FPR): `{fpr_k:.2%}` | Taxa FN (FNR): `{fnr_k:.2%}` | Suporte Positivo: `{m_info.support_positive}`")
+                    st.divider()
+
+    # 8. Persistência Física no Disco e Opções de Download
+    saved_paths = export_evaluation_report_to_disk(project, eval_report, run_id)
+
+    st.success(
+        f"💾 **Relatórios de Avaliação e Matrizes Salvos Fisicamente no Disco!**\n\n"
+        f"Os arquivos de métricas foram gravados na pasta de saída configurada do projeto:\n\n"
+        f"- 🎯 **Métricas Globais (CSV):** `{project.classification_dir / 'metricas_avaliacao_globais.csv'}`\n"
+        f"- 🏷️ **Métricas por Classe (CSV):** `{project.classification_dir / 'metricas_avaliacao_classes.csv'}`\n"
+        f"- 🚫 **Diagnóstico da Classe 0 (CSV):** `{project.classification_dir / 'diagnostico_classe_0.csv'}`\n"
+        f"- 📝 **Relatório Completo em Markdown:** `{project.classification_dir / 'relatorio_avaliacao.md'}`\n\n"
+        f"📍 **Pasta Local dos Arquivos:** `{project.classification_dir.resolve()}`"
+    )
+
+    col_dl_ev1, col_dl_ev2, col_dl_ev3, col_dl_ev4 = st.columns(4)
+    p_glob = project.classification_dir / 'metricas_avaliacao_globais.csv'
+    col_dl_ev1.download_button(
+        label="📥 Métricas Globais (.csv)",
+        data=p_glob.read_bytes() if p_glob.exists() else df_g.to_csv(index=False).encode("utf-8"),
+        file_name=f"metricas_avaliacao_globais_{run_id}.csv",
+        mime="text/csv",
+        key=f"dl_eval_glob_{key_suffix}",
+        use_container_width=True
+    )
+    p_cls = project.classification_dir / 'metricas_avaliacao_classes.csv'
+    col_dl_ev2.download_button(
+        label="📥 Métricas por Classe (.csv)",
+        data=p_cls.read_bytes() if p_cls.exists() else df_c.to_csv(index=False).encode("utf-8"),
+        file_name=f"metricas_avaliacao_classes_{run_id}.csv",
+        mime="text/csv",
+        key=f"dl_eval_cls_{key_suffix}",
+        use_container_width=True
+    )
+    p_c0 = project.classification_dir / 'diagnostico_classe_0.csv'
+    col_dl_ev3.download_button(
+        label="📥 Diagnóstico Classe 0 (.csv)",
+        data=p_c0.read_bytes() if p_c0.exists() else (df_c0.to_csv(index=False).encode("utf-8") if df_c0 is not None and not df_c0.empty else b""),
+        file_name=f"diagnostico_classe_0_{run_id}.csv",
+        mime="text/csv",
+        key=f"dl_eval_c0_{key_suffix}",
+        use_container_width=True
+    )
+    p_md = project.classification_dir / 'relatorio_avaliacao.md'
+    col_dl_ev4.download_button(
+        label="📥 Relatório Completo (.md)",
+        data=p_md.read_text(encoding="utf-8") if p_md.exists() else md_text,
+        file_name=f"relatorio_avaliacao_{run_id}.md",
+        mime="text/markdown",
+        key=f"dl_eval_md_{key_suffix}",
+        use_container_width=True
+    )
 
 
 def main():
@@ -1286,6 +1522,7 @@ def main():
                     r.semantic_score = res_map.get(k, res_map.get(r.paragraph_id, 0.0))
 
                 st.session_state.semantic_scores_map = res_map
+                st.session_state.semantic_search_results = results
                 candidates = [r for r in st.session_state.corpus_records if (r.semantic_score or 0.0) >= th]
                 st.session_state.semantic_candidates = candidates
                 dur = time.time() - start_t
@@ -1386,6 +1623,90 @@ def main():
                         st.plotly_chart(fig_curve, use_container_width=True)
                         render_interpretation_box("Curva de sensibilidade demonstrando a variação do número de parágrafos preservados à medida que o limiar θ_s varia de 0.00 a 1.00.")
 
+                # ----------------------------------------------------
+                # ESTATÍSTICAS E GRÁFICOS POR SENTENÇA-ÂNCORA
+                # ----------------------------------------------------
+                sem_res_list = getattr(st.session_state, "semantic_search_results", [])
+                if sem_res_list:
+                    st.divider()
+                    st.markdown("### 🎯 Estatísticas Detalhadas por Sentença-Âncora")
+                    st.caption("Desempenho comparativo individual de cada sentença-âncora de referência em relação ao corpus de parágrafos e documentos.")
+
+                    df_anchor_stats = compute_per_anchor_statistics(
+                        results=sem_res_list,
+                        reference_set=st.session_state.reference_set,
+                        threshold=float(fn["threshold"])
+                    )
+                    st.session_state.df_anchor_stats = df_anchor_stats
+
+                    if not df_anchor_stats.empty:
+                        # Gravação física imediata no disco
+                        export_anchor_statistics_to_disk(project, df_anchor_stats, st.session_state.run_id)
+
+                        st.dataframe(df_anchor_stats, use_container_width=True)
+
+                        anc_csv_disk = project.semantic_dir / "estatisticas_ancoras.csv"
+                        anc_csv_bytes = anc_csv_disk.read_bytes() if anc_csv_disk.exists() else df_anchor_stats.to_csv(index=False, encoding="utf-8").encode("utf-8")
+
+                        anc_md_disk = project.semantic_dir / "estatisticas_ancoras.md"
+                        anc_md_str = anc_md_disk.read_text(encoding="utf-8") if anc_md_disk.exists() else df_anchor_stats.to_markdown(index=False)
+
+                        # Opções de Download das Estatísticas por Âncora
+                        col_dl_anc1, col_dl_anc2 = st.columns(2)
+                        col_dl_anc1.download_button(
+                            label="📥 Baixar Estatísticas por Âncora em CSV (.csv)",
+                            data=anc_csv_bytes,
+                            file_name=f"estatisticas_ancoras_{st.session_state.run_id}.csv",
+                            mime="text/csv",
+                            key="dl_anc_csv_t4",
+                            use_container_width=True
+                        )
+                        col_dl_anc2.download_button(
+                            label="📥 Baixar Tabela de Âncoras em Markdown (.md)",
+                            data=anc_md_str,
+                            file_name=f"estatisticas_ancoras_{st.session_state.run_id}.md",
+                            mime="text/markdown",
+                            key="dl_anc_md_t4",
+                            use_container_width=True
+                        )
+
+                        col_anc_plot1, col_anc_plot2 = st.columns(2)
+                        with col_anc_plot1:
+                            fig_anc_bars = px.bar(
+                                df_anchor_stats,
+                                x="Âncora ID",
+                                y=["Parágrafos (≥ θ_s)", "Documentos Únicos (≥ θ_s)"],
+                                barmode="group",
+                                hover_data=["Texto da Âncora", "Score Médio", "Melhor Âncora (A*)"],
+                                title="Retenção de Parágrafos e Documentos Únicos por Âncora",
+                                labels={"value": "Quantidade", "variable": "Métrica"}
+                            )
+                            fig_anc_bars.update_layout(legend_title_text="Dimensão")
+                            st.plotly_chart(fig_anc_bars, use_container_width=True)
+
+                        with col_anc_plot2:
+                            # Boxplot da distribuição de similaridade por âncora
+                            anc_sample_data = []
+                            for r in sem_res_list[:3000]:
+                                for a_id, a_sc in r.anchor_scores.items():
+                                    anc_sample_data.append({"Âncora ID": a_id, "Similaridade Cosseno": a_sc})
+                            if anc_sample_data:
+                                df_anc_box = pd.DataFrame(anc_sample_data)
+                                fig_anc_box = px.box(
+                                    df_anc_box,
+                                    x="Âncora ID",
+                                    y="Similaridade Cosseno",
+                                    color="Âncora ID",
+                                    title="Dispersão dos Scores Cosseno por Sentença-Âncora"
+                                )
+                                fig_anc_box.add_hline(
+                                    y=float(fn["threshold"]),
+                                    line_dash="dash",
+                                    line_color="red",
+                                    annotation_text=f"θ_s = {fn['threshold']:.2f}"
+                                )
+                                st.plotly_chart(fig_anc_box, use_container_width=True)
+
                 if candidates:
                     st.divider()
                     st.subheader(f"Parágrafos Selecionados pela Busca Semântica ({len(candidates):,} Itens Preservados)".replace(",", "."))
@@ -1459,7 +1780,46 @@ def main():
                                 st.caption(f"Score Cosseno: `{target_cand.semantic_score:.4f}` | Limiar θ_s: `{fn['threshold']:.2f}`")
                                 st.text_area("Texto Integral do Parágrafo:", value=target_cand.text, height=150, disabled=True)
 
+                # ----------------------------------------------------
+                # PERSISTÊNCIA FÍSICA AUTOMÁTICA NO DISCO
+                # ----------------------------------------------------
+                saved_cand_paths = export_semantic_candidates_to_disk(
+                    project=project,
+                    candidates=candidates,
+                    run_id=st.session_state.run_id,
+                    df_anchor_stats=getattr(st.session_state, "df_anchor_stats", None)
+                )
+
+                st.success(
+                    f"💾 **Candidatos Semânticos e Estatísticas por Âncora Salvos no Disco!**\n\n"
+                    f"Todos os dados da busca semântica foram gravados na pasta de saída configurada do projeto:\n\n"
+                    f"- 🎯 **Estatísticas por Sentença-Âncora (CSV):** `{project.semantic_dir / 'estatisticas_ancoras.csv'}`\n"
+                    f"- 🎯 **Estatísticas por Sentença-Âncora (Markdown):** `{project.semantic_dir / 'estatisticas_ancoras.md'}`\n"
+                    f"- 🎯 **Estatísticas por Sentença-Âncora (Parquet):** `{project.semantic_dir / 'estatisticas_ancoras.parquet'}`\n"
+                    f"- 📄 **Tabela Geral de Candidatos (CSV):** `{project.semantic_dir / 'candidates.csv'}`\n"
+                    f"- ⚡ **Candidatos em Formato Colunar (Parquet):** `{project.semantic_dir / 'candidates.parquet'}`\n"
+                    f"- 📦 **Candidatos em JSON Lines (JSONL):** `{project.semantic_dir / 'candidates.jsonl'}`\n"
+                    f"- 📝 **Documento dos Candidatos (Markdown):** `{project.semantic_dir / 'candidates.md'}`\n\n"
+                    f"📍 **Pasta Local dos Arquivos:** `{project.semantic_dir.resolve()}`"
+                )
+
+                col_sync_t4_1, col_sync_t4_2 = st.columns([2, 2])
+                with col_sync_t4_1:
+                    if st.button("🔄 Sincronizar e Gravar Candidatos e Estatísticas no Disco Novamente", key="btn_sync_t4_disk", use_container_width=True):
+                        export_semantic_candidates_to_disk(
+                            project=project,
+                            candidates=candidates,
+                            run_id=st.session_state.run_id,
+                            df_anchor_stats=getattr(st.session_state, "df_anchor_stats", None)
+                        )
+                        st.toast("✓ Candidatos e estatísticas por âncora gravados no disco com sucesso!")
+                with col_sync_t4_2:
+                    st.caption(f"📁 Localização: `{project.semantic_dir}`")
+
                 # Opção de Download da Etapa 4 (Recuperação por Cosseno)
+                csv_cand_disk = project.semantic_dir / "candidates.csv"
+                csv_cand_bytes = csv_cand_disk.read_bytes() if csv_cand_disk.exists() else df_t4.to_csv(index=False, encoding="utf-8").encode("utf-8")
+
                 md_t4 = f"# Parágrafos Candidatos — Recuperação por Similaridade Semântica (Cosine Similarity)\n\n" + f"- **Threshold Aplicado (θ_s):** `{fn['threshold']:.2f}`\n- **Total Selecionados:** `{len(candidates)}`\n\n---\n\n" + "\n\n---\n\n".join(
                     f"## Parágrafo `{r.paragraph_id}` (`{r.article_id}`)\n- **Score Cosseno:** `{r.semantic_score:.4f}`\n\n{r.text}" for r in candidates[:1000]
                 )
@@ -1929,6 +2289,25 @@ def main():
                             clf.save(st.session_state.run_dirs["models"])
                             st.session_state.logistic_classifier = clf
 
+                            # Cálculo das métricas completas de avaliação supervisionada
+                            thresh_dict = getattr(st.session_state, "optimal_thresholds", None) or {
+                                "definition": 0.50, "determinant": 0.50, "type_dimension": 0.50, "causal_relation": 0.50, "property": 0.50
+                            }
+                            y_probs = clf.predict_proba(X_tr)
+                            y_pred_bin = clf.predict_with_thresholds(X_tr, thresh_dict)
+
+                            eval_rep = compute_multilabel_evaluation(
+                                model_id=f"logistic_regression_{st.session_state.run_id}",
+                                classifier_type="LogisticRegression (One-vs-Rest Multilabel)",
+                                y_true_binary=y_tr,
+                                y_probs=y_probs,
+                                y_pred_binary=y_pred_bin,
+                                thresholds=thresh_dict,
+                                total_articles=len(set(a.document_id for a in valid_gold_records if a.document_id))
+                            )
+                            st.session_state.evaluation_report = eval_rep
+                            st.session_state.eval_report = eval_rep
+
                             dur = time.time() - start_t
                             if 5 not in st.session_state.completed_steps:
                                 st.session_state.completed_steps.append(5)
@@ -1936,53 +2315,116 @@ def main():
                             save_full_session_state(project, st.session_state)
                             import gc; gc.collect()
 
-                            status_box.update(label=f"✓ Modelo supervisionado treinado com sucesso em {dur:.1f}s!", state="complete", expanded=False)
-                            st.toast("✓ Classificador supervisionado treinado com sucesso!")
+                            status_box.update(label=f"✓ Modelo supervisionado treinado e avaliado com sucesso em {dur:.1f}s!", state="complete", expanded=False)
+                            st.toast("✓ Classificador treinado e métricas calculadas!")
                             st.balloons()
                             render_completion_panel(
-                                title="Treinamento do Classificador Concluído",
+                                title="Treinamento e Avaliação do Classificador Concluídos",
                                 metrics={
                                     "Amostras Gold Standard": len(valid_gold_records),
+                                    "Macro-F1": f"{eval_rep.macro_f1:.4f}",
+                                    "Micro-F1": f"{eval_rep.micro_f1:.4f}",
                                     "Tempo Total": f"{dur:.2f}s"
                                 }
                             )
+
+            # Se o modelo já estiver treinado, renderiza o painel de avaliação supervisionada em Sub-t6
+            if getattr(st.session_state, "evaluation_report", None) is not None:
+                st.divider()
+                st.subheader("Avaliação Detalhada do Modelo Treinado")
+                render_supervised_evaluation_panel(
+                    eval_report=st.session_state.evaluation_report,
+                    project=project,
+                    run_id=st.session_state.run_id,
+                    key_suffix="sub6"
+                )
 
         # ------------------------------------------
         # SUB-ABA 7: AVALIAÇÃO E CONCORDÂNCIA
         # ------------------------------------------
         with sub_t7:
-            st.subheader("Avaliação de Desempenho e Concordância entre Anotadores")
-            
-            all_recs = ann_service.load_annotations()
-            agreement_res = compute_inter_annotator_agreement(all_recs)
+            st.subheader("Avaliação Quantitativa do Modelo e Concordância entre Anotadores")
 
-            if agreement_res.get("has_paired_annotations"):
-                st.markdown("#### Concordância entre Anotadores (Cohen's Kappa — κ)")
-                st.latex(r"\kappa = \frac{p_o - p_e}{1 - p_e}")
-                st.markdown(
-                    "**Onde:**\n"
-                    "- **κ:** Coeficiente Kappa de Cohen\n"
-                    "- **p_o:** Proporção de concordância observada entre os dois anotadores\n"
-                    "- **p_e:** Proporção de concordância esperada ao acaso"
-                )
+            tab_ev1, tab_ev2 = st.tabs([
+                "📈 1. Desempenho do Modelo Supervisionado (Macro/Micro F1, Precision, Recall e Matrizes)",
+                "👥 2. Concordância Interanotador (Cohen's Kappa)"
+            ])
 
-                st.metric("Macro Kappa (Concordância Global)", f"{agreement_res['macro_kappa']:.4f}")
-                st.write("")
+            with tab_ev1:
+                eval_rep_to_show = getattr(st.session_state, "evaluation_report", None) or getattr(st.session_state, "eval_report", None)
+                if eval_rep_to_show is None and st.session_state.logistic_classifier is not None and len(valid_gold_records) >= 5 and st.session_state.embeddings_matrix is not None:
+                    try:
+                        id_to_idx = {r.paragraph_id: idx for idx, r in enumerate(st.session_state.corpus_records)}
+                        X_ev_list, y_ev_list = [], []
+                        for a in valid_gold_records:
+                            if a.paragraph_id in id_to_idx:
+                                X_ev_list.append(st.session_state.embeddings_matrix[id_to_idx[a.paragraph_id]])
+                                y_ev_list.append(a.labels_binary)
+                        if X_ev_list:
+                            X_ev = np.array(X_ev_list)
+                            y_ev = np.array(y_ev_list)
+                            clf = st.session_state.logistic_classifier
+                            th_d = getattr(st.session_state, "optimal_thresholds", None) or {"definition": 0.5, "determinant": 0.5, "type_dimension": 0.5, "causal_relation": 0.5, "property": 0.5}
+                            y_probs = clf.predict_proba(X_ev)
+                            y_pred_bin = clf.predict_with_thresholds(X_ev, th_d)
+                            eval_rep_to_show = compute_multilabel_evaluation(
+                                model_id=f"logistic_regression_{st.session_state.run_id}",
+                                classifier_type="LogisticRegression (One-vs-Rest Multilabel)",
+                                y_true_binary=y_ev,
+                                y_probs=y_probs,
+                                y_pred_binary=y_pred_bin,
+                                thresholds=th_d,
+                                total_articles=len(set(a.document_id for a in valid_gold_records if a.document_id))
+                            )
+                            st.session_state.evaluation_report = eval_rep_to_show
+                    except Exception as e:
+                        logger.warning(f"Erro ao computar relatório de avaliação na sub-aba 7: {e}")
 
-                df_agree = pd.DataFrame([
-                    {
-                        "Classe Conceitual": k,
-                        "Concordância Observada (p_o)": f"{v['p_o']:.4f}",
-                        "Concordância Esperada (p_e)": f"{v['p_e']:.4f}",
-                        "Cohen's Kappa (κ)": f"{v['kappa']:.4f}",
-                        "Amostras Pareadas": v["n_samples"]
-                    }
-                    for k, v in agreement_res["per_class_agreement"].items()
-                ])
-                st.dataframe(df_agree, use_container_width=True)
-                render_interpretation_box("O coeficiente Kappa avalia a concordância entre anotadores descontando a concordância esperada ao acaso.")
-            else:
-                st.info(agreement_res.get("message", "Nenhum dado de concordância disponível."))
+                if eval_rep_to_show is not None:
+                    render_supervised_evaluation_panel(
+                        eval_report=eval_rep_to_show,
+                        project=project,
+                        run_id=st.session_state.run_id,
+                        key_suffix="sub7"
+                    )
+                else:
+                    render_empty_state(
+                        title="Avaliação Supervisionada Indisponível",
+                        description="Treine o classificador na Sub-aba '6. Treinar Modelo' para gerar métricas completas (Macro-F1, Micro-F1, Precisão, Recall e Matrizes de Confusão Binárias por classe).",
+                        recommendation="Aguardando treinamento do modelo."
+                    )
+
+            with tab_ev2:
+                all_recs = ann_service.load_annotations()
+                agreement_res = compute_inter_annotator_agreement(all_recs)
+
+                if agreement_res.get("has_paired_annotations"):
+                    st.markdown("#### Concordância entre Anotadores (Cohen's Kappa — κ)")
+                    st.latex(r"\kappa = \frac{p_o - p_e}{1 - p_e}")
+                    st.markdown(
+                        "**Onde:**\n"
+                        "- **κ:** Coeficiente Kappa de Cohen\n"
+                        "- **p_o:** Proporção de concordância observada entre os dois anotadores\n"
+                        "- **p_e:** Proporção de concordância esperada ao acaso"
+                    )
+
+                    st.metric("Macro Kappa (Concordância Global)", f"{agreement_res['macro_kappa']:.4f}")
+                    st.write("")
+
+                    df_agree = pd.DataFrame([
+                        {
+                            "Classe Conceitual": k,
+                            "Concordância Observada (p_o)": f"{v['p_o']:.4f}",
+                            "Concordância Esperada (p_e)": f"{v['p_e']:.4f}",
+                            "Cohen's Kappa (κ)": f"{v['kappa']:.4f}",
+                            "Amostras Pareadas": v["n_samples"]
+                        }
+                        for k, v in agreement_res["per_class_agreement"].items()
+                    ])
+                    st.dataframe(df_agree, use_container_width=True)
+                    render_interpretation_box("O coeficiente Kappa avalia a concordância entre anotadores descontando a concordância esperada ao acaso.")
+                else:
+                    st.info(agreement_res.get("message", "Nenhum dado de concordância disponível."))
 
     # ==========================================
     # ABA 6: CLASSIFICAÇÃO CONCEITUAL
@@ -2130,10 +2572,25 @@ def main():
                                     else:
                                         r.status = "MODEL_NOT_RELEVANT"
 
-                                status_box.update(label=f"Classificando parágrafos em lote: {b_end:,} de {total_cand:,} processados...", state="running")
-
                             dur = time.time() - start_t
                             st.session_state.classified_records = candidates
+
+                            # Sincroniza e reseta registros não classificados nesta rodada para não misturar execuções antigas
+                            cand_id_set = {r.paragraph_id for r in candidates}
+                            for r in st.session_state.corpus_records:
+                                if r.paragraph_id not in cand_id_set and r.status in ["MODEL_RELEVANT", "MODEL_NOT_RELEVANT"]:
+                                    r.status = "CANDIDATE" if r.semantic_score is not None else "INGESTED"
+                                    r.predicted_labels = []
+                                    r.predicted_probabilities = {}
+
+                            # Invalida explicitamente os artefatos do Índice RAG (Etapa 7) para forçar nova construção
+                            st.session_state.rag_index_stats = None
+                            st.session_state.rag_index_manifest = None
+                            st.session_state.rag_index_zip_path = None
+                            st.session_state.rag_retriever = None
+                            if 7 in st.session_state.completed_steps:
+                                st.session_state.completed_steps.remove(7)
+
                             st.session_state.funnel_counts["6_Classificacao"] = {
                                 "n_in": total_cand,
                                 "n_out": relevant_count,
@@ -2156,9 +2613,7 @@ def main():
                         status_box.update(label=f"✕ Ocorreu um erro durante a classificação: {err}", state="error", expanded=True)
                         st.error(f"Erro detalhado na execução da classificação: {err}")
 
-            classified_records = [r for r in st.session_state.corpus_records if r.status in ["MODEL_RELEVANT", "MODEL_NOT_RELEVANT"]]
-            if not classified_records and st.session_state.classified_records:
-                classified_records = st.session_state.classified_records
+            classified_records = st.session_state.classified_records or [r for r in st.session_state.corpus_records if r.status in ["MODEL_RELEVANT", "MODEL_NOT_RELEVANT"]]
 
             if classified_records:
                 st.divider()
@@ -2187,6 +2642,181 @@ def main():
                             "Tempo de Execução": f"{dur:.2f}s"
                         }
                     )
+
+                # ----------------------------------------------------
+                # ESTATÍSTICAS AVANÇADAS: PARÁGRAFOS E DOCUMENTOS
+                # ----------------------------------------------------
+                total_p = len(classified_records)
+                all_docs = sorted(list(set(r.article_id for r in classified_records)))
+                total_docs = len(all_docs)
+
+                rel_p = [r for r in classified_records if r.status == "MODEL_RELEVANT"]
+                not_rel_p = [r for r in classified_records if r.status == "MODEL_NOT_RELEVANT"]
+
+                rel_docs = set(r.article_id for r in rel_p)
+                not_rel_docs = set(all_docs) - rel_docs
+
+                doc_rel_counts = {doc: 0 for doc in all_docs}
+                for r in rel_p:
+                    doc_rel_counts[r.article_id] += 1
+
+                rel_counts_per_doc = [c for c in doc_rel_counts.values() if c > 0]
+                mean_p_per_doc = float(np.mean(rel_counts_per_doc)) if rel_counts_per_doc else 0.0
+                med_p_per_doc = float(np.median(rel_counts_per_doc)) if rel_counts_per_doc else 0.0
+
+                st.markdown("### 📊 Métricas Globais de Cobertura (Parágrafos e Documentos)")
+                m_c1, m_c2, m_c3, m_c4 = st.columns(4)
+                m_c1.metric(
+                    "Parágrafos Relevantes",
+                    f"{len(rel_p):,}".replace(",", "."),
+                    delta=f"{(len(rel_p)/total_p*100):.1f}% do total analisado" if total_p > 0 else "0.0%"
+                )
+                m_c2.metric(
+                    "Documentos com Evidências",
+                    f"{len(rel_docs):,}".replace(",", "."),
+                    delta=f"{(len(rel_docs)/total_docs*100):.1f}% dos artigos" if total_docs > 0 else "0.0%"
+                )
+                m_c3.metric(
+                    "Documentos Descartados",
+                    f"{len(not_rel_docs):,}".replace(",", "."),
+                    delta=f"{(len(not_rel_docs)/total_docs*100):.1f}% sem evidências" if total_docs > 0 else "0.0%",
+                    delta_color="inverse"
+                )
+                m_c4.metric(
+                    "Densidade Relevante",
+                    f"{mean_p_per_doc:.1f} p/doc",
+                    delta=f"Mediana: {med_p_per_doc:.1f}"
+                )
+
+                # ----------------------------------------------------
+                # TABELA E GRÁFICOS POR CLASSE CONCEITUAL (0 A 5)
+                # ----------------------------------------------------
+                st.markdown("#### 🏷️ Distribuição por Classe Conceitual (Parágrafos vs. Documentos Únicos)")
+
+                class_stat_rows = []
+                p_c0 = len(not_rel_p)
+                d_c0 = len(set(r.article_id for r in not_rel_p))
+                class_stat_rows.append({
+                    "Classe ID": 0,
+                    "Dimensão Conceitual": CONCEPT_LABEL_NAMES[0],
+                    "Parágrafos (N)": p_c0,
+                    "% Parágrafos": f"{(p_c0/total_p*100):.1f}%" if total_p > 0 else "0.0%",
+                    "Documentos Únicos (N)": d_c0,
+                    "% Documentos": f"{(d_c0/total_docs*100):.1f}%" if total_docs > 0 else "0.0%",
+                    "Probabilidade Média": "—",
+                    "Probabilidade Mediana": "—",
+                    "Probabilidade Máxima": "—"
+                })
+
+                probs_per_class = {c: [] for c in MULTILABEL_CLASSES}
+                for c in MULTILABEL_CLASSES:
+                    c_name = CONCEPT_LABEL_SHORT_NAMES[c]
+                    p_matching = [r for r in classified_records if c_name in r.predicted_labels]
+                    d_matching = set(r.article_id for r in p_matching)
+
+                    c_probs = [r.predicted_probabilities.get(c_name, 0.0) for r in classified_records if r.predicted_probabilities]
+                    probs_per_class[c] = c_probs
+
+                    mean_prob = float(np.mean(c_probs)) if c_probs else 0.0
+                    med_prob = float(np.median(c_probs)) if c_probs else 0.0
+                    max_prob = float(np.max(c_probs)) if c_probs else 0.0
+
+                    class_stat_rows.append({
+                        "Classe ID": c,
+                        "Dimensão Conceitual": CONCEPT_LABEL_NAMES[c],
+                        "Parágrafos (N)": len(p_matching),
+                        "% Parágrafos": f"{(len(p_matching)/total_p*100):.1f}%" if total_p > 0 else "0.0%",
+                        "Documentos Únicos (N)": len(d_matching),
+                        "% Documentos": f"{(len(d_matching)/total_docs*100):.1f}%" if total_docs > 0 else "0.0%",
+                        "Probabilidade Média": f"{mean_prob:.4f}",
+                        "Probabilidade Mediana": f"{med_prob:.4f}",
+                        "Probabilidade Máxima": f"{max_prob:.4f}"
+                    })
+
+                df_class_stats = pd.DataFrame(class_stat_rows)
+                st.dataframe(df_class_stats, use_container_width=True)
+
+                col_pl1, col_pl2 = st.columns(2)
+                with col_pl1:
+                    df_bar_data = df_class_stats[["Dimensão Conceitual", "Parágrafos (N)", "Documentos Únicos (N)"]].melt(
+                        id_vars=["Dimensão Conceitual"],
+                        value_vars=["Parágrafos (N)", "Documentos Únicos (N)"],
+                        var_name="Tipo de Contagem",
+                        value_name="Quantidade"
+                    )
+                    fig_classes_bar = px.bar(
+                        df_bar_data,
+                        x="Dimensão Conceitual",
+                        y="Quantidade",
+                        color="Tipo de Contagem",
+                        barmode="group",
+                        title="Comparação: Parágrafos vs. Documentos Únicos por Classe Conceitual",
+                        color_discrete_map={"Parágrafos (N)": "#2563eb", "Documentos Únicos (N)": "#10b981"}
+                    )
+                    fig_classes_bar.update_layout(xaxis_tickangle=-20)
+                    st.plotly_chart(fig_classes_bar, use_container_width=True)
+
+                with col_pl2:
+                    box_probs_data = []
+                    for c in MULTILABEL_CLASSES:
+                        c_label = f"C{c} — {CONCEPT_LABEL_NAMES[c].split('—')[1].strip() if '—' in CONCEPT_LABEL_NAMES[c] else CONCEPT_LABEL_NAMES[c]}"
+                        for p_val in probs_per_class[c][:3000]:
+                            box_probs_data.append({"Classe": c_label, "Probabilidade Estimada": p_val})
+
+                    if box_probs_data:
+                        df_box_probs = pd.DataFrame(box_probs_data)
+                        fig_probs_box = px.box(
+                            df_box_probs,
+                            x="Classe",
+                            y="Probabilidade Estimada",
+                            color="Classe",
+                            title="Dispersão das Probabilidades Preditas por Dimensão Conceitual"
+                        )
+                        fig_probs_box.update_layout(showlegend=False, xaxis_tickangle=-20)
+                        st.plotly_chart(fig_probs_box, use_container_width=True)
+
+                # ----------------------------------------------------
+                # DISTRIBUIÇÃO POR PROBABILIDADE MÁXIMA (PARÁGRAFOS E DOCUMENTOS)
+                # ----------------------------------------------------
+                st.markdown("#### 📈 Distribuição de Trabalhos e Parágrafos por Probabilidade Máxima (P_max)")
+
+                p_max_paras = [max(r.predicted_probabilities.values()) if r.predicted_probabilities else 0.0 for r in classified_records]
+
+                doc_pmax_map = {doc: 0.0 for doc in all_docs}
+                for r in classified_records:
+                    if r.predicted_probabilities:
+                        curr_max = max(r.predicted_probabilities.values())
+                        if curr_max > doc_pmax_map[r.article_id]:
+                            doc_pmax_map[r.article_id] = curr_max
+
+                doc_pmax_values = list(doc_pmax_map.values())
+
+                col_hist1, col_hist2 = st.columns(2)
+                with col_hist1:
+                    fig_pmax_para = px.histogram(
+                        p_max_paras,
+                        nbins=25,
+                        title="Distribuição de Parágrafos por Probabilidade Máxima P_max",
+                        labels={"value": "Probabilidade Máxima do Parágrafo", "count": "Frequência de Parágrafos"},
+                        color_discrete_sequence=["#3b82f6"]
+                    )
+                    fig_pmax_para.add_vline(x=0.50, line_dash="dash", line_color="orange", annotation_text="P=0.50")
+                    fig_pmax_para.add_vline(x=0.75, line_dash="dash", line_color="green", annotation_text="P=0.75")
+                    st.plotly_chart(fig_pmax_para, use_container_width=True)
+                    render_interpretation_box("Histograma da probabilidade máxima de pertinência a qualquer dimensão conceituada. Parágrafos à direita de 0.50 possuem maior robustez semântica.")
+
+                with col_hist2:
+                    fig_pmax_doc = px.histogram(
+                        doc_pmax_values,
+                        nbins=25,
+                        title="Distribuição de Documentos (Trabalhos) por Maior P_max Interno",
+                        labels={"value": "Maior Probabilidade no Artigo (P_max_doc)", "count": "Frequência de Artigos"},
+                        color_discrete_sequence=["#10b981"]
+                    )
+                    fig_pmax_doc.add_vline(x=0.50, line_dash="dash", line_color="orange", annotation_text="P=0.50")
+                    fig_pmax_doc.add_vline(x=0.75, line_dash="dash", line_color="green", annotation_text="P=0.75 (Forte)")
+                    st.plotly_chart(fig_pmax_doc, use_container_width=True)
+                    render_interpretation_box("Distribuição dos artigos científicos pela evidência mais forte contida neles. Indica quantos trabalhos trazem evidências conceituais categóricas.")
 
                 st.subheader(f"Parágrafos Classificados ({len(classified_records):,} Itens Processados)".replace(",", "."))
 
@@ -2218,7 +2848,7 @@ def main():
                 # Conteúdo para Exportação e Download
                 md_t6 = "# Corpus Final Classificado — SLD (Etapa 6)\n\n" + f"**Data de Geração:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n**Total Parágrafos Exibidos:** {len(view_records)}\n\n---\n\n" + "\n\n---\n\n".join(
                     f"## Parágrafo `{r.paragraph_id}` (`{r.article_id}`)\n- **Status:** `{r.status}`\n- **Similaridade Cosseno:** `{r.semantic_score or 0.0:.4f}`\n- **Classes Atribuídas:** `{', '.join(r.predicted_labels) if r.predicted_labels else 'Nenhum'}`\n- **Probabilidades:** `{json.dumps(r.predicted_probabilities)}` \n\n{r.text}"
-                    for r in view_records
+                    for r in view_records[:1000]
                 )
                 df_t6 = pd.DataFrame([{
                     "paragraph_id": r.paragraph_id,
@@ -2239,28 +2869,85 @@ def main():
                     "text": r.text
                 }, ensure_ascii=False) for r in view_records)
 
+                # ----------------------------------------------------
+                # PERSISTÊNCIA FÍSICA AUTOMÁTICA NO DISCO
+                # ----------------------------------------------------
+                saved_class_paths = export_classified_corpus_to_disk(project, classified_records, st.session_state.run_id)
+                stats_csv_p = project.classification_dir / "estatisticas_classes.csv"
+                try:
+                    df_class_stats.to_csv(stats_csv_p, index=False, encoding="utf-8")
+                    saved_class_paths["stats_csv"] = stats_csv_p
+                except Exception:
+                    pass
+
+                # Aviso visual claro com caminhos absolutos e relativos no disco
+                st.success(
+                    f"💾 **Dados Refinados Salvos Fisicamente no Disco!**\n\n"
+                    f"Todos os registros classificados foram gravados automaticamente na pasta de saída configurada. "
+                    f"Você pode acessá-los diretamente no seu computador para abrir no Excel, R, Python, SPSS, Stata ou Obsidian:\n\n"
+                    f"- 📄 **Tabela Estruturada (CSV):** `{project.classification_dir / 'classified_corpus.csv'}`\n"
+                    f"- ⚡ **Formato Colunar (Parquet):** `{project.classification_dir / 'classified_corpus.parquet'}`\n"
+                    f"- 📦 **Formato JSON Lines (JSONL):** `{project.classification_dir / 'classified_corpus.jsonl'}`\n"
+                    f"- 📝 **Documento Completo (Markdown):** `{project.classification_dir / 'classified_corpus.md'}`\n"
+                    f"- 📊 **Estatísticas por Dimensão (CSV):** `{project.classification_dir / 'estatisticas_classes.csv'}`\n\n"
+                    f"📍 **Pasta Local dos Arquivos:** `{project.classification_dir.resolve()}`"
+                )
+
+                col_sync_d1, col_sync_d2 = st.columns([2, 2])
+                with col_sync_d1:
+                    if st.button("🔄 Sincronizar e Gravar Arquivos no Disco Novamente", key="btn_sync_t6_disk", use_container_width=True):
+                        export_classified_corpus_to_disk(project, classified_records, st.session_state.run_id)
+                        df_class_stats.to_csv(stats_csv_p, index=False, encoding="utf-8")
+                        st.toast("✓ Todos os arquivos foram sincronizados e gravados no disco com sucesso!")
+                with col_sync_d2:
+                    st.caption(f"📁 Localização: `{project.classification_dir}`")
+
+                # Conteúdo para Exportação e Download
+                csv_disk_file = project.classification_dir / "classified_corpus.csv"
+                csv_data_bytes = csv_disk_file.read_bytes() if csv_disk_file.exists() else df_t6.to_csv(index=False, encoding="utf-8").encode("utf-8")
+
+                jsonl_disk_file = project.classification_dir / "classified_corpus.jsonl"
+                jsonl_data_bytes = jsonl_disk_file.read_bytes() if jsonl_disk_file.exists() else jsonl_t6.encode("utf-8")
+
+                md_disk_file = project.classification_dir / "classified_corpus.md"
+                md_data_str = md_disk_file.read_text(encoding="utf-8") if md_disk_file.exists() else md_t6
+
+                stats_disk_file = project.classification_dir / "estatisticas_classes.csv"
+                stats_data_bytes = stats_disk_file.read_bytes() if stats_disk_file.exists() else df_class_stats.to_csv(index=False, encoding="utf-8").encode("utf-8")
+
                 # Botões de Download Diretos e Seção de Exportação
                 st.markdown("#### 📥 Opções de Download dos Resultados")
-                col_dl_md, col_dl_csv, col_dl_jsonl = st.columns(3)
+                col_dl_md, col_dl_csv, col_dl_jsonl, col_dl_st = st.columns(4)
                 col_dl_md.download_button(
                     label="📥 Baixar em Markdown (.md)",
-                    data=md_t6,
+                    data=md_data_str,
                     file_name=f"corpus_classificado_{st.session_state.run_id}.md",
                     mime="text/markdown",
+                    key="btn_dl_md_t6_class",
                     use_container_width=True
                 )
                 col_dl_csv.download_button(
                     label="📥 Baixar Tabela em CSV (.csv)",
-                    data=df_t6.to_csv(index=False, encoding="utf-8"),
+                    data=csv_data_bytes,
                     file_name=f"corpus_classificado_{st.session_state.run_id}.csv",
                     mime="text/csv",
+                    key="btn_dl_csv_t6_class",
                     use_container_width=True
                 )
                 col_dl_jsonl.download_button(
                     label="📥 Baixar Dados em JSONL (.jsonl)",
-                    data=jsonl_t6,
+                    data=jsonl_data_bytes,
                     file_name=f"corpus_classificado_{st.session_state.run_id}.jsonl",
                     mime="application/jsonlines",
+                    key="btn_dl_jsonl_t6_class",
+                    use_container_width=True
+                )
+                col_dl_st.download_button(
+                    label="📥 Baixar Estatísticas por Classe (.csv)",
+                    data=stats_data_bytes,
+                    file_name=f"estatisticas_classes_{st.session_state.run_id}.csv",
+                    mime="text/csv",
+                    key="btn_dl_stats_t6_class",
                     use_container_width=True
                 )
 
@@ -2340,9 +3027,7 @@ def main():
 
         # 1. CORPUS DISPONÍVEL PARA INDEXAÇÃO
         st.markdown("### 📊 1. Corpus Disponível para Indexação")
-        classified_recs = [r for r in st.session_state.corpus_records if r.status in ["MODEL_RELEVANT", "MODEL_NOT_RELEVANT"]]
-        if not classified_recs and st.session_state.classified_records:
-            classified_recs = st.session_state.classified_records
+        classified_recs = st.session_state.classified_records or [r for r in st.session_state.corpus_records if r.status in ["MODEL_RELEVANT", "MODEL_NOT_RELEVANT"]]
 
         if not classified_recs:
             render_empty_state(
@@ -2351,240 +3036,278 @@ def main():
                 recommendation="Aguardando classificação supervisionada por regressão logística."
             )
         else:
-            dist_stats = compute_corpus_distribution_stats(classified_recs)
+            sub_rag_1, sub_rag_2, sub_rag_3 = st.tabs([
+                "🏗️ 1. Construção, Estatísticas e Pacote RAG",
+                "🔎 2. Teste Operacional e Busca Vetorial Top-k",
+                "📂 3. Carregamento e Restauração de Índice"
+            ])
 
-            c_st1, c_st2, c_st3, c_st4 = st.columns(4)
-            c_st1.metric("Parágrafos Classificados", f"{dist_stats.total_classified:,}".replace(",", "."))
-            c_st2.metric("Relevantes Únicos (Classes 1–5)", f"{dist_stats.total_unique_relevant:,}".replace(",", "."), delta=f"{dist_stats.pct_relevant:.1f}% do total")
-            c_st3.metric("Não Relevantes (Classe 0)", f"{dist_stats.class_0_not_relevant:,}".replace(",", "."), delta=f"-{dist_stats.pct_class_0:.1f}% descartados")
-            c_st4.metric("Ocorrências Multilabel", f"{dist_stats.total_multilabel_occurrences:,}".replace(",", "."))
+            with sub_rag_1:
+                dist_stats = compute_corpus_distribution_stats(classified_recs)
 
-            # Distribuição das Classes
-            st.markdown("##### Distribuição de Ocorrências por Classe Conceitual")
-            st.caption("ℹ️ *Como a classificação é multilabel, um mesmo parágrafo pode pertencer a várias classes (1 a 5). Por isso, a soma das ocorrências pode ser superior ao número de parágrafos únicos.*")
+                c_st1, c_st2, c_st3, c_st4 = st.columns(4)
+                c_st1.metric("Parágrafos Classificados", f"{dist_stats.total_classified:,}".replace(",", "."))
+                c_st2.metric("Relevantes Únicos (Classes 1–5)", f"{dist_stats.total_unique_relevant:,}".replace(",", "."), delta=f"{dist_stats.pct_relevant:.1f}% do total")
+                c_st3.metric("Não Relevantes (Classe 0)", f"{dist_stats.class_0_not_relevant:,}".replace(",", "."), delta=f"-{dist_stats.pct_class_0:.1f}% descartados")
+                c_st4.metric("Ocorrências Multilabel", f"{dist_stats.total_multilabel_occurrences:,}".replace(",", "."))
 
-            col_tb_cls, col_gr_cls = st.columns([1, 1])
+                # Distribuição das Classes
+                st.markdown("##### Distribuição de Ocorrências por Classe Conceitual")
+                st.caption("ℹ️ *Como a classificação é multilabel, um mesmo parágrafo pode pertencer a várias classes (1 a 5). Por isso, a soma das ocorrências pode ser superior ao número de parágrafos únicos.*")
 
-            class_table_rows = [
-                {"Código": "Classe 0", "Categoria": "Não Relevante", "Ocorrências": dist_stats.class_0_not_relevant, "Status": "Excluída do Índice", "% do Corpus": f"{dist_stats.pct_class_0:.2f}%"},
-                {"Código": "Classe 1", "Categoria": "Definição ou Conceituação", "Ocorrências": dist_stats.class_1_definition, "Status": "Indexada", "% do Corpus": f"{(dist_stats.class_1_definition / max(1, dist_stats.total_classified) * 100):.2f}%"},
-                {"Código": "Classe 2", "Categoria": "Fator Determinante", "Ocorrências": dist_stats.class_2_determinant, "Status": "Indexada", "% do Corpus": f"{(dist_stats.class_2_determinant / max(1, dist_stats.total_classified) * 100):.2f}%"},
-                {"Código": "Classe 3", "Categoria": "Tipo ou Dimensão", "Ocorrências": dist_stats.class_3_type_dimension, "Status": "Indexada", "% do Corpus": f"{(dist_stats.class_3_type_dimension / max(1, dist_stats.total_classified) * 100):.2f}%"},
-                {"Código": "Classe 4", "Categoria": "Relação Causal", "Ocorrências": dist_stats.class_4_causal_relation, "Status": "Indexada", "% do Corpus": f"{(dist_stats.class_4_causal_relation / max(1, dist_stats.total_classified) * 100):.2f}%"},
-                {"Código": "Classe 5", "Categoria": "Característica ou Propriedade", "Ocorrências": dist_stats.class_5_property, "Status": "Indexada", "% do Corpus": f"{(dist_stats.class_5_property / max(1, dist_stats.total_classified) * 100):.2f}%"},
-            ]
-            with col_tb_cls:
-                st.dataframe(pd.DataFrame(class_table_rows), use_container_width=True, hide_index=True)
+                col_tb_cls, col_gr_cls = st.columns([1, 1])
 
-            with col_gr_cls:
-                df_plot_cls = pd.DataFrame([
-                    {"Classe": "Classe 1: Definição", "Ocorrências": dist_stats.class_1_definition, "Cor": "#16a34a"},
-                    {"Classe": "Classe 2: Fator", "Ocorrências": dist_stats.class_2_determinant, "Cor": "#2563eb"},
-                    {"Classe": "Classe 3: Tipo/Dimensão", "Ocorrências": dist_stats.class_3_type_dimension, "Cor": "#9333ea"},
-                    {"Classe": "Classe 4: Causal", "Ocorrências": dist_stats.class_4_causal_relation, "Cor": "#ea580c"},
-                    {"Classe": "Classe 5: Propriedade", "Ocorrências": dist_stats.class_5_property, "Cor": "#0d9488"},
-                    {"Classe": "Classe 0: Não Relevante", "Ocorrências": dist_stats.class_0_not_relevant, "Cor": "#94a3b8"},
-                ])
-                fig_cls = px.bar(
-                    df_plot_cls,
-                    x="Classe",
-                    y="Ocorrências",
-                    color="Classe",
-                    color_discrete_sequence=["#16a34a", "#2563eb", "#9333ea", "#ea580c", "#0d9488", "#94a3b8"],
-                    title="Distribuição das Classes no Corpus",
-                )
-                fig_cls.update_layout(showlegend=False, margin=dict(l=20, r=20, t=40, b=20), height=260)
-                st.plotly_chart(fig_cls, use_container_width=True)
+                class_table_rows = [
+                    {"Código": "Classe 0", "Categoria": "Não Relevante", "Ocorrências": dist_stats.class_0_not_relevant, "Status": "Excluída do Índice", "% do Corpus": f"{dist_stats.pct_class_0:.2f}%"},
+                    {"Código": "Classe 1", "Categoria": "Definição ou Conceituação", "Ocorrências": dist_stats.class_1_definition, "Status": "Indexada", "% do Corpus": f"{(dist_stats.class_1_definition / max(1, dist_stats.total_classified) * 100):.2f}%"},
+                    {"Código": "Classe 2", "Categoria": "Fator Determinante", "Ocorrências": dist_stats.class_2_determinant, "Status": "Indexada", "% do Corpus": f"{(dist_stats.class_2_determinant / max(1, dist_stats.total_classified) * 100):.2f}%"},
+                    {"Código": "Classe 3", "Categoria": "Tipo ou Dimensão", "Ocorrências": dist_stats.class_3_type_dimension, "Status": "Indexada", "% do Corpus": f"{(dist_stats.class_3_type_dimension / max(1, dist_stats.total_classified) * 100):.2f}%"},
+                    {"Código": "Classe 4", "Categoria": "Relação Causal", "Ocorrências": dist_stats.class_4_causal_relation, "Status": "Indexada", "% do Corpus": f"{(dist_stats.class_4_causal_relation / max(1, dist_stats.total_classified) * 100):.2f}%"},
+                    {"Código": "Classe 5", "Categoria": "Característica ou Propriedade", "Ocorrências": dist_stats.class_5_property, "Status": "Indexada", "% do Corpus": f"{(dist_stats.class_5_property / max(1, dist_stats.total_classified) * 100):.2f}%"},
+                ]
+                with col_tb_cls:
+                    st.dataframe(pd.DataFrame(class_table_rows), use_container_width=True, hide_index=True)
 
-            st.divider()
-
-            # 2. CONFIGURAÇÕES DO ÍNDICE FAISS
-            st.markdown("### ⚙️ 2. Configurações do Índice FAISS")
-            col_cfg1, col_cfg2, col_cfg3 = st.columns(3)
-            with col_cfg1:
-                idx_type = st.radio(
-                    "Tipo de Indexação FAISS:",
-                    options=["HNSW", "FlatIP"],
-                    format_func=lambda x: "IndexHNSWFlat — Busca Aproximada Rápida (Recomendado para grandes volumes)" if x == "HNSW" else "IndexFlatIP — Busca Exata (Benchmark / Validação)",
-                    index=0,
-                    help="HNSW constrói um grafo de vizinhança hierárquico extremamente rápido. FlatIP realiza força-bruta exata por produto interno.",
-                    key="idx_type_t7"
-                )
-            with col_cfg2:
-                idx_version = st.text_input("Versão do Índice:", value="v001", help="Identificador de versão para reprodutibilidade.", key="idx_version_t7")
-                batch_size_idx = st.selectbox("Batch Size de Inserção:", options=[2048, 4096, 8192, 16384], index=2, help="Lote de vetores transferidos à memória do FAISS.", key="batch_size_idx_t7")
-            with col_cfg3:
-                emb_dim = st.session_state.embeddings_matrix.shape[1] if st.session_state.embeddings_matrix is not None else 384
-                st.text_input("Dimensão dos Embeddings:", value=f"{emb_dim} dimensões", disabled=True, key="emb_dim_t7")
-                st.text_input("Métrica de Similaridade:", value="Produto Interno (Cosine Similarity)", disabled=True, key="emb_metric_t7")
-
-            with st.expander("🛠️ Parâmetros Avançados do Grafo HNSW (Opcional)", expanded=False):
-                col_adv1, col_adv2, col_adv3 = st.columns(3)
-                with col_adv1:
-                    hnsw_m = st.number_input("Conexões por Vértice (M):", min_value=8, max_value=128, value=32, step=8, help="Número de links bidirecionais por nó no grafo HNSW.", key="hnsw_m_t7")
-                with col_adv2:
-                    hnsw_ef_c = st.number_input("efConstruction:", min_value=16, max_value=256, value=64, step=16, help="Tamanho da fila durante a construção do grafo.", key="hnsw_ef_c_t7")
-                with col_adv3:
-                    hnsw_ef_s = st.number_input("efSearch:", min_value=16, max_value=256, value=64, step=16, help="Tamanho da fila durante as buscas de vizinhos.", key="hnsw_ef_s_t7")
-
-            # 3. CONSTRUÇÃO DO ÍNDICE
-            if st.button("🚀 Construir Índice de Recuperação do Corpus Refinado", type="primary"):
-                if dist_stats.total_unique_relevant == 0:
-                    st.error("Não há parágrafos classificados como relevantes (Classes 1 a 5) para indexação.")
-                elif st.session_state.embeddings_matrix is None:
-                    st.error("Matriz de embeddings não encontrada na sessão.")
-                else:
-                    target_out_dir = Path(st.session_state.get("selected_output_dir", DEFAULT_OUTPUT_DIR))
-                    rag_cfg = RAGIndexConfig(
-                        index_type=idx_type,
-                        dimension=emb_dim,
-                        M=hnsw_m if idx_type == "HNSW" else 32,
-                        efConstruction=hnsw_ef_c if idx_type == "HNSW" else 64,
-                        efSearch=hnsw_ef_s if idx_type == "HNSW" else 64,
-                        index_batch_size=batch_size_idx,
-                        normalize_embeddings=True
+                with col_gr_cls:
+                    df_plot_cls = pd.DataFrame([
+                        {"Classe": "Classe 1: Definição", "Ocorrências": dist_stats.class_1_definition, "Cor": "#16a34a"},
+                        {"Classe": "Classe 2: Fator", "Ocorrências": dist_stats.class_2_determinant, "Cor": "#2563eb"},
+                        {"Classe": "Classe 3: Tipo/Dimensão", "Ocorrências": dist_stats.class_3_type_dimension, "Cor": "#9333ea"},
+                        {"Classe": "Classe 4: Causal", "Ocorrências": dist_stats.class_4_causal_relation, "Cor": "#ea580c"},
+                        {"Classe": "Classe 5: Propriedade", "Ocorrências": dist_stats.class_5_property, "Cor": "#0d9488"},
+                        {"Classe": "Classe 0: Não Relevante", "Ocorrências": dist_stats.class_0_not_relevant, "Cor": "#94a3b8"},
+                    ])
+                    fig_cls = px.bar(
+                        df_plot_cls,
+                        x="Classe",
+                        y="Ocorrências",
+                        color="Classe",
+                        color_discrete_sequence=["#16a34a", "#2563eb", "#9333ea", "#ea580c", "#0d9488", "#94a3b8"],
+                        title="Distribuição das Classes no Corpus",
                     )
-                    builder = RAGIndexBuilder(output_dir=target_out_dir, config=rag_cfg)
+                    fig_cls.update_layout(showlegend=False, margin=dict(l=20, r=20, t=40, b=20), height=260)
+                    st.plotly_chart(fig_cls, use_container_width=True)
 
-                    tracker = ProgressTracker(
-                        title="Construção do Índice de Recuperação FAISS + Parquet",
-                        total=dist_stats.total_unique_relevant,
-                        steps=["Filtrar e Deduplicar Corpus Refinado", "Inserir Vetores no FAISS em Lote", "Gerar Metadados Parquet", "Validar Integridade e Empacotar ZIP"],
-                        update_interval=1
+                st.divider()
+
+                # 2. CONFIGURAÇÕES DO ÍNDICE FAISS
+                st.markdown("### ⚙️ Configurações de Construção do Índice FAISS")
+                col_cfg1, col_cfg2, col_cfg3 = st.columns(3)
+                with col_cfg1:
+                    idx_type = st.radio(
+                        "Tipo de Indexação FAISS:",
+                        options=["HNSW", "FlatIP"],
+                        format_func=lambda x: "IndexHNSWFlat — Busca Aproximada Rápida (Recomendado para grandes volumes)" if x == "HNSW" else "IndexFlatIP — Busca Exata (Benchmark / Validação)",
+                        index=0,
+                        help="HNSW constrói um grafo de vizinhança hierárquico extremamente rápido. FlatIP realiza força-bruta exata por produto interno.",
+                        key="idx_type_t7"
                     )
-                    tracker.set_step(0, "Filtrando parágrafos relevantes...")
+                with col_cfg2:
+                    idx_version = st.text_input("Versão do Índice:", value="v001", help="Identificador de versão para reprodutibilidade.", key="idx_version_t7")
+                    batch_size_idx = st.selectbox("Batch Size de Inserção:", options=[2048, 4096, 8192, 16384], index=2, help="Lote de vetores transferidos à memória do FAISS.", key="batch_size_idx_t7")
+                with col_cfg3:
+                    emb_dim = st.session_state.embeddings_matrix.shape[1] if st.session_state.embeddings_matrix is not None else 384
+                    st.text_input("Dimensão dos Embeddings:", value=f"{emb_dim} dimensões", disabled=True, key="emb_dim_t7")
+                    st.text_input("Métrica de Similaridade:", value="Produto Interno (Cosine Similarity)", disabled=True, key="emb_metric_t7")
 
-                    def idx_progress_cb(processed, total, msg):
-                        tracker.set_step(1, msg)
-                        tracker.update(processed=processed, current_item=msg, step_processed=processed, step_total=total)
+                with st.expander("🛠️ Parâmetros Avançados do Grafo HNSW (Opcional)", expanded=False):
+                    col_adv1, col_adv2, col_adv3 = st.columns(3)
+                    with col_adv1:
+                        hnsw_m = st.number_input("Conexões por Vértice (M):", min_value=8, max_value=128, value=32, step=8, help="Número de links bidirecionais por nó no grafo HNSW.", key="hnsw_m_t7")
+                    with col_adv2:
+                        hnsw_ef_c = st.number_input("efConstruction:", min_value=16, max_value=256, value=64, step=16, help="Tamanho da fila durante a construção do grafo.", key="hnsw_ef_c_t7")
+                    with col_adv3:
+                        hnsw_ef_s = st.number_input("efSearch:", min_value=16, max_value=256, value=64, step=16, help="Tamanho da fila durante as buscas de vizinhos.", key="hnsw_ef_s_t7")
 
-                    try:
-                        tracker.set_step(1, "Inserindo vetores no índice FAISS...")
-                        faiss_p, parquet_p, manifest_p, zip_p, idx_stats, manifest_obj = builder.build(
-                            corpus_records=classified_recs,
-                            embeddings_matrix=st.session_state.embeddings_matrix,
-                            all_corpus_records=st.session_state.corpus_records,
-                            total_original_articles=len(set(r.article_id for r in st.session_state.corpus_records)),
-                            embedding_model_name=st.session_state.config.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
-                            index_version=idx_version,
-                            progress_callback=idx_progress_cb
+                # 3. CONSTRUÇÃO DO ÍNDICE
+                if st.button("🚀 Construir / Atualizar Índice de Recuperação do Corpus Refinado", type="primary", key="btn_build_rag_index_t7"):
+                    if dist_stats.total_unique_relevant == 0:
+                        st.error("Não há parágrafos classificados como relevantes (Classes 1 a 5) para indexação.")
+                    elif st.session_state.embeddings_matrix is None:
+                        st.error("Matriz de embeddings não encontrada na sessão.")
+                    else:
+                        target_out_dir = Path(st.session_state.get("selected_output_dir", DEFAULT_OUTPUT_DIR))
+                        rag_cfg = RAGIndexConfig(
+                            index_type=idx_type,
+                            dimension=emb_dim,
+                            M=hnsw_m if idx_type == "HNSW" else 32,
+                            efConstruction=hnsw_ef_c if idx_type == "HNSW" else 64,
+                            efSearch=hnsw_ef_s if idx_type == "HNSW" else 64,
+                            index_batch_size=batch_size_idx,
+                            normalize_embeddings=True
                         )
+                        builder = RAGIndexBuilder(output_dir=target_out_dir, config=rag_cfg)
 
-                        st.session_state.rag_index_stats = idx_stats
-                        st.session_state.rag_index_manifest = manifest_obj
-                        st.session_state.rag_index_zip_path = str(zip_p)
+                        tracker = ProgressTracker(
+                            title="Construção do Índice de Recuperação FAISS + Parquet",
+                            total=dist_stats.total_unique_relevant,
+                            steps=["Filtrar e Deduplicar Corpus Refinado", "Inserir Vetores no FAISS em Lote", "Gerar Metadados Parquet", "Validar Integridade e Empacotar ZIP"],
+                            update_interval=1
+                        )
+                        tracker.set_step(0, "Filtrando parágrafos relevantes...")
 
-                        retriever = RAGIndexRetriever()
-                        retriever.load_from_dir(faiss_p.parent)
-                        st.session_state.rag_retriever = retriever
+                        def idx_progress_cb(processed, total, msg):
+                            tracker.set_step(1, msg)
+                            tracker.update(processed=processed, current_item=msg, step_processed=processed, step_total=total)
 
-                        if 7 not in st.session_state.completed_steps:
-                            st.session_state.completed_steps.append(7)
+                        try:
+                            tracker.set_step(1, "Inserindo vetores no índice FAISS...")
+                            faiss_p, parquet_p, manifest_p, zip_p, idx_stats, manifest_obj = builder.build(
+                                corpus_records=classified_recs,
+                                embeddings_matrix=st.session_state.embeddings_matrix,
+                                all_corpus_records=st.session_state.corpus_records,
+                                total_original_articles=len(set(r.article_id for r in st.session_state.corpus_records)),
+                                embedding_model_name=st.session_state.config.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
+                                index_version=idx_version,
+                                progress_callback=idx_progress_cb
+                            )
 
-                        save_full_session_state(project, st.session_state)
-                        import gc; gc.collect()
+                            st.session_state.rag_index_stats = idx_stats
+                            st.session_state.rag_index_manifest = manifest_obj
+                            st.session_state.rag_index_zip_path = str(zip_p)
+                            st.session_state.rag_retriever = None
 
-                        tracker.complete(message=f"✓ Índice RAG {idx_version} construído com sucesso! {idx_stats.total_vectors:,} vetores indexados.", show_balloons=True)
-                        st.toast("✓ Índice de Recuperação do Corpus Refinado construído com sucesso!")
-                        st.balloons()
-                        st.rerun()
+                            if 7 not in st.session_state.completed_steps:
+                                st.session_state.completed_steps.append(7)
 
-                    except Exception as err:
-                        st.error(f"Erro na construção do índice RAG: {err}")
+                            save_full_session_state(project, st.session_state)
+                            import gc; gc.collect()
 
-            # 4. EXIBIÇÃO DE ESTATÍSTICAS E PAINEL PÓS-CONSTRUÇÃO
-            if st.session_state.rag_index_stats is not None:
-                st.divider()
-                st.markdown("### 📈 3. Estatísticas do Índice de Recuperação")
-                stats_obj = st.session_state.rag_index_stats
-                manifest_obj = st.session_state.rag_index_manifest
+                            tracker.complete(message=f"✓ Índice RAG {idx_version} construído com sucesso! {idx_stats.total_vectors:,} vetores indexados.", show_balloons=True)
+                            st.toast("✓ Índice de Recuperação do Corpus Refinado construído com sucesso!")
+                            st.balloons()
+                            st.rerun()
 
-                render_completion_panel(
-                    title=f"Índice de Recuperação RAG ({manifest_obj.index_version if manifest_obj else 'v001'}) Operacional",
-                    metrics={
-                        "Total de Vetores Indexados": f"{stats_obj.total_vectors:,}".replace(",", "."),
-                        "Parágrafos Únicos": f"{stats_obj.unique_paragraphs:,}".replace(",", "."),
-                        "Documentos Representados": f"{stats_obj.represented_documents:,}".replace(",", "."),
-                        "Dimensão dos Embeddings": f"{stats_obj.embedding_dimension}D",
-                        "Tipo de Índice FAISS": stats_obj.index_type,
-                        "Métrica Utilizada": stats_obj.metric,
-                        "Tamanho FAISS em Disco": f"{stats_obj.faiss_file_size_bytes / (1024*1024):.2f} MB",
-                        "Tamanho Parquet": f"{stats_obj.parquet_file_size_bytes / (1024*1024):.2f} MB",
-                        "Tamanho Pacote ZIP": f"{stats_obj.zip_file_size_bytes / (1024*1024):.2f} MB",
-                        "Tempo de Construção": f"{stats_obj.build_duration_sec:.2f}s"
-                    }
-                )
+                        except Exception as err:
+                            st.error(f"Erro na construção do índice RAG: {err}")
 
-                if stats_obj.coverage:
-                    cov = stats_obj.coverage
-                    st.markdown("#### 📚 Cobertura Documental e Densidade")
-                    col_cv1, col_cv2, col_cv3, col_cv4, col_cv5 = st.columns(5)
-                    col_cv1.metric("Artigos no Corpus", f"{cov.total_original_articles}")
-                    col_cv2.metric("Artigos no Índice", f"{cov.indexed_articles}", delta=f"{cov.pct_articles_represented:.1f}% representados")
-                    col_cv3.metric("Média Parágrafos/Artigo", f"{cov.mean_paragraphs_per_article:.2f}")
-                    col_cv4.metric("Mediana Parágrafos/Artigo", f"{cov.median_paragraphs_per_article:.1f}")
-                    col_cv5.metric("Min / Max por Artigo", f"{cov.min_paragraphs_per_article} / {cov.max_paragraphs_per_article}")
+                # 4. EXIBIÇÃO DE ESTATÍSTICAS E PAINEL PÓS-CONSTRUÇÃO
+                if st.session_state.rag_index_stats is not None:
+                    st.divider()
+                    st.markdown("### 📈 Estatísticas do Índice de Recuperação")
+                    stats_obj = st.session_state.rag_index_stats
+                    manifest_obj = st.session_state.rag_index_manifest
 
-                # 5. INTEGRIDADE, AUDITORIA E DOWNLOAD
-                st.divider()
-                st.markdown("### 🔒 4. Integridade do Pacote e Opções de Download")
-
-                col_chk_b1, col_chk_b2, col_chk_b3, col_chk_b4 = st.columns(4)
-                col_chk_b1.success("✓ Índice FAISS Validado (ntotal)")
-                col_chk_b2.success("✓ Metadados Parquet Validados")
-                col_chk_b3.success("✓ Mapeamento de IDs Validado")
-                col_chk_b4.success("✓ Hashes SHA-256 Registrados")
-
-                if manifest_obj and manifest_obj.checksums:
-                    with st.expander("🔍 Visualizar Assinaturas Criptográficas SHA-256", expanded=False):
-                        for f_name, f_hash in manifest_obj.checksums.items():
-                            st.code(f"{f_hash}  {f_name}", language="text")
-
-                zip_path_str = st.session_state.rag_index_zip_path
-                if zip_path_str and Path(zip_path_str).exists():
-                    zip_file_p = Path(zip_path_str)
-                    with open(zip_file_p, "rb") as zf:
-                        zip_bytes = zf.read()
-
-                    st.download_button(
-                        label="📦 Baixar Pacote Completo do Índice RAG (.zip) — Formato Recomendado",
-                        data=zip_bytes,
-                        file_name=zip_file_p.name,
-                        mime="application/zip",
-                        type="primary",
-                        use_container_width=True,
-                        help="Contém o índice corpus_refinado.faiss, metadata.parquet, manifest.json, index_report.md e README.md."
+                    render_completion_panel(
+                        title=f"Índice de Recuperação RAG ({manifest_obj.index_version if manifest_obj else 'v001'}) Operacional",
+                        metrics={
+                            "Total de Vetores Indexados": f"{stats_obj.total_vectors:,}".replace(",", "."),
+                            "Parágrafos Únicos": f"{stats_obj.unique_paragraphs:,}".replace(",", "."),
+                            "Documentos Representados": f"{stats_obj.represented_documents:,}".replace(",", "."),
+                            "Dimensão dos Embeddings": f"{stats_obj.embedding_dimension}D",
+                            "Tipo de Índice FAISS": stats_obj.index_type,
+                            "Métrica Utilizada": stats_obj.metric,
+                            "Tamanho FAISS em Disco": f"{stats_obj.faiss_file_size_bytes / (1024*1024):.2f} MB",
+                            "Tamanho Parquet": f"{stats_obj.parquet_file_size_bytes / (1024*1024):.2f} MB",
+                            "Tamanho Pacote ZIP": f"{stats_obj.zip_file_size_bytes / (1024*1024):.2f} MB",
+                            "Tempo de Construção": f"{stats_obj.build_duration_sec:.2f}s"
+                        }
                     )
+
+                    if stats_obj.coverage:
+                        cov = stats_obj.coverage
+                        st.markdown("#### 📚 Cobertura Documental e Densidade")
+                        col_cv1, col_cv2, col_cv3, col_cv4, col_cv5 = st.columns(5)
+                        col_cv1.metric("Artigos no Corpus", f"{cov.total_original_articles}")
+                        col_cv2.metric("Artigos no Índice", f"{cov.indexed_articles}", delta=f"{cov.pct_articles_represented:.1f}% representados")
+                        col_cv3.metric("Média Parágrafos/Artigo", f"{cov.mean_paragraphs_per_article:.2f}")
+                        col_cv4.metric("Mediana Parágrafos/Artigo", f"{cov.median_paragraphs_per_article:.1f}")
+                        col_cv5.metric("Min / Max por Artigo", f"{cov.min_paragraphs_per_article} / {cov.max_paragraphs_per_article}")
+
+                    # 5. INTEGRIDADE, AUDITORIA E DOWNLOAD
+                    st.divider()
+                    st.markdown("### 🔒 Integridade do Pacote e Opções de Download")
+
+                    col_chk_b1, col_chk_b2, col_chk_b3, col_chk_b4 = st.columns(4)
+                    col_chk_b1.success("✓ Índice FAISS Validado (ntotal)")
+                    col_chk_b2.success("✓ Metadados Parquet Validados")
+                    col_chk_b3.success("✓ Mapeamento de IDs Validado")
+                    col_chk_b4.success("✓ Hashes SHA-256 Registrados")
+
+                    if manifest_obj and manifest_obj.checksums:
+                        with st.expander("🔍 Visualizar Assinaturas Criptográficas SHA-256", expanded=False):
+                            for f_name, f_hash in manifest_obj.checksums.items():
+                                st.code(f"{f_hash}  {f_name}", language="text")
+
+                    zip_path_str = st.session_state.rag_index_zip_path
+                    target_out_dir = Path(st.session_state.get("selected_output_dir", DEFAULT_OUTPUT_DIR)) / "rag_index"
+                    
+                    st.info(f"📁 **Diretório dos Artefatos em Disco:** `{target_out_dir.resolve()}`")
+
+                    if zip_path_str and Path(zip_path_str).exists():
+                        zip_file_p = Path(zip_path_str)
+                        zip_size_mb = zip_file_p.stat().st_size / (1024 * 1024)
+
+                        col_dl_main_1, col_dl_main_2 = st.columns([3, 1])
+                        with col_dl_main_1:
+                            st.caption(f"Pacote consolidado: **{zip_file_p.name}** ({zip_size_mb:.2f} MB)")
+                            if zip_size_mb < 50.0:
+                                with open(zip_file_p, "rb") as zf:
+                                    st.download_button(
+                                        label=f"📦 Baixar Pacote Completo (.zip) — {zip_size_mb:.1f} MB",
+                                        data=zf.read(),
+                                        file_name=zip_file_p.name,
+                                        mime="application/zip",
+                                        type="primary",
+                                        key="btn_dl_rag_zip_main",
+                                        use_container_width=True,
+                                        help="Contém o índice corpus_refinado.faiss, metadata.parquet, manifest.json, index_report.md e README.md."
+                                    )
+                            else:
+                                if st.checkbox("📥 Carregar Pacote ZIP para Download no Navegador", key="chk_load_rag_zip"):
+                                    with open(zip_file_p, "rb") as zf:
+                                        st.download_button(
+                                            label=f"📦 Clique para Salvar {zip_file_p.name} ({zip_size_mb:.1f} MB)",
+                                            data=zf.read(),
+                                            file_name=zip_file_p.name,
+                                            mime="application/zip",
+                                            type="primary",
+                                            key="btn_dl_rag_zip_main_loaded",
+                                            use_container_width=True
+                                        )
+
+                    if target_out_dir.exists():
+                        with st.expander("📥 Arquivos Individuais do Índice", expanded=False):
+                            col_dl_f, col_dl_p, col_dl_m, col_dl_r = st.columns(4)
+
+                            f_faiss = target_out_dir / "corpus_refinado.faiss"
+                            f_pq = target_out_dir / "metadata.parquet"
+                            f_mani = target_out_dir / "manifest.json"
+                            f_rep = target_out_dir / "index_report.md"
+
+                            if f_mani.exists():
+                                with open(f_mani, "r", encoding="utf-8") as f:
+                                    col_dl_m.download_button("📥 Baixar manifest.json", data=f.read(), file_name="manifest.json", mime="application/json", key="dl_f_mani", use_container_width=True)
+                            if f_rep.exists():
+                                with open(f_rep, "r", encoding="utf-8") as f:
+                                    col_dl_r.download_button("📥 Baixar index_report.md", data=f.read(), file_name="index_report.md", mime="text/markdown", key="dl_f_rep", use_container_width=True)
+
+                            if f_faiss.exists():
+                                sz_faiss_mb = f_faiss.stat().st_size / (1024 * 1024)
+                                if sz_faiss_mb < 30.0:
+                                    with open(f_faiss, "rb") as f:
+                                        col_dl_f.download_button(f"📥 Baixar .faiss ({sz_faiss_mb:.1f}MB)", data=f.read(), file_name="corpus_refinado.faiss", key="dl_f_faiss", use_container_width=True)
+                                else:
+                                    col_dl_f.caption(f"💾 `corpus_refinado.faiss` ({sz_faiss_mb:.1f} MB) salvo no disco")
+
+                            if f_pq.exists():
+                                sz_pq_mb = f_pq.stat().st_size / (1024 * 1024)
+                                if sz_pq_mb < 30.0:
+                                    with open(f_pq, "rb") as f:
+                                        col_dl_p.download_button(f"📥 Baixar .parquet ({sz_pq_mb:.1f}MB)", data=f.read(), file_name="metadata.parquet", key="dl_f_pq", use_container_width=True)
+                                else:
+                                    col_dl_p.caption(f"💾 `metadata.parquet` ({sz_pq_mb:.1f} MB) salvo no disco")
+
+            # ----------------------------------------------------
+            # SUB-ABA 2: TESTE OPERACIONAL E BUSCA VETORIAL TOP-K
+            # ----------------------------------------------------
+            with sub_rag_2:
+                st.subheader("🔎 Teste Operacional do Índice RAG (Busca Vetorial Top-k)")
+                st.caption("Execute consultas em linguagem natural diretamente no índice FAISS sobre os metadados para avaliar a proximidade semântica antes de acionar a LLM.")
 
                 target_out_dir = Path(st.session_state.get("selected_output_dir", DEFAULT_OUTPUT_DIR)) / "rag_index"
-                if target_out_dir.exists():
-                    with st.expander("📥 Baixar Arquivos Individuais do Índice", expanded=False):
-                        col_dl_f, col_dl_p, col_dl_m, col_dl_r = st.columns(4)
 
-                        f_faiss = target_out_dir / "corpus_refinado.faiss"
-                        f_pq = target_out_dir / "metadata.parquet"
-                        f_mani = target_out_dir / "manifest.json"
-                        f_rep = target_out_dir / "index_report.md"
-
-                        if f_faiss.exists():
-                            with open(f_faiss, "rb") as f:
-                                col_dl_f.download_button("📥 Baixar .faiss", data=f.read(), file_name="corpus_refinado.faiss", use_container_width=True)
-                        if f_pq.exists():
-                            with open(f_pq, "rb") as f:
-                                col_dl_p.download_button("📥 Baixar .parquet", data=f.read(), file_name="metadata.parquet", use_container_width=True)
-                        if f_mani.exists():
-                            with open(f_mani, "rb") as f:
-                                col_dl_m.download_button("📥 Baixar manifest.json", data=f.read(), file_name="manifest.json", use_container_width=True)
-                        if f_rep.exists():
-                            with open(f_rep, "rb") as f:
-                                col_dl_r.download_button("📥 Baixar index_report.md", data=f.read(), file_name="index_report.md", use_container_width=True)
-
-                # 6. TESTE DO ÍNDICE (CONSULTA TOP-K SEM LLM)
-                st.divider()
-                st.markdown("### 🔎 5. Teste Operacional do Índice RAG (Busca Vetorial Top-k)")
-                st.caption("Execute consultas de teste diretamente no índice FAISS sobre os metadados para avaliar a proximidade semântica antes de acionar a LLM.")
-
-                col_q_txt, col_q_cls, col_q_k = st.columns([3, 2, 1])
+                col_q_txt, col_q_cls = st.columns([3, 2])
                 with col_q_txt:
                     test_query_str = st.text_input("Consulta Textual de Teste:", value="definição de governança e mecanismos adaptativos", help="Texto de entrada a ser vetorizado pelo mesmo modelo de embeddings.", key="test_query_str_t7")
                 with col_q_cls:
@@ -2601,29 +3324,98 @@ def main():
                         help="Exibe apenas resultados que contenham as classes conceituais selecionadas.",
                         key="filter_classes_req_t7"
                     )
-                with col_q_k:
-                    test_top_k = st.selectbox("Top-k Resultados:", options=[5, 10, 20, 50], index=0, key="test_top_k_t7")
 
-                if st.button("🔍 Executar Consulta Vetorial de Teste", type="secondary"):
+                col_sim_range, col_q_k = st.columns([3, 1])
+                with col_sim_range:
+                    sim_range = st.slider(
+                        "Faixa de Similaridade Cosseno [Limiar Mínimo (θ_min), Limiar Máximo (θ_max)]:",
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=(0.00, 1.00),
+                        step=0.01,
+                        format="%.2f",
+                        help="Filtra os resultados recuperados pela proximidade vetorial. Apenas parágrafos com score dentro de [θ_min, θ_max] serão retornados.",
+                        key="rag_sim_range_t7"
+                    )
+                    min_sim_val, max_sim_val = sim_range
+                with col_q_k:
+                    test_top_k = st.selectbox("Top-k Resultados:", options=[5, 10, 20, 50, 100, 200], index=0, key="test_top_k_t7")
+
+                if st.button("🔍 Executar Consulta Vetorial de Teste", type="primary", key="btn_run_query_rag_t7"):
                     if not test_query_str.strip():
                         st.warning("Digite uma consulta textual para testar.")
                     else:
                         emb_srv = EmbeddingService(model_name=st.session_state.config.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
-                        if st.session_state.rag_retriever is None:
+                        if st.session_state.rag_retriever is None and target_out_dir.exists():
                             st.session_state.rag_retriever = RAGIndexRetriever()
                             st.session_state.rag_retriever.load_from_dir(target_out_dir)
 
-                        q_results = st.session_state.rag_retriever.query(
-                            query_text=test_query_str,
-                            embedding_service=emb_srv,
-                            top_k=test_top_k,
-                            required_classes=[f"class_{c}" for c in filter_classes_req] if filter_classes_req else None
-                        )
-                        st.session_state.rag_query_results = q_results
+                        if st.session_state.rag_retriever is None or st.session_state.rag_retriever.faiss_index is None:
+                            st.error("O índice RAG ainda não foi construído ou carregado na sessão. Construa o índice na Sub-aba 1.")
+                        else:
+                            q_results = st.session_state.rag_retriever.query(
+                                query_text=test_query_str,
+                                embedding_service=emb_srv,
+                                top_k=test_top_k,
+                                required_classes=[f"class_{c}" for c in filter_classes_req] if filter_classes_req else None,
+                                min_score=min_sim_val,
+                                max_score=max_sim_val
+                            )
+                            st.session_state.rag_query_results = q_results
 
-                if st.session_state.rag_query_results:
-                    st.markdown(f"#### Resultados da Busca Vetorial ({len(st.session_state.rag_query_results)} parágrafos recuperados)")
-                    for r in st.session_state.rag_query_results:
+                if getattr(st.session_state, "rag_query_results", None):
+                    q_res = st.session_state.rag_query_results
+                    st.markdown(f"#### Resultados da Busca Vetorial ({len(q_res)} parágrafos recuperados)")
+                    st.caption(f"Filtro aplicado: Similaridade Cosseno entre **{min_sim_val:.2f}** e **{max_sim_val:.2f}** | Top-{test_top_k} max.")
+
+                    # Exportações em CSV e Markdown
+                    df_q_export = pd.DataFrame([{
+                        "rank": r.rank,
+                        "score": round(r.score, 4),
+                        "paragraph_id": r.paragraph_id,
+                        "article_id": r.article_id,
+                        "classes": ", ".join(r.classes),
+                        "faiss_id": r.faiss_id,
+                        "text": r.text
+                    } for r in q_res])
+
+                    md_q_export = (
+                        f"# Resultados da Busca Vetorial no Índice RAG\n\n"
+                        f"- **Consulta:** `{test_query_str}`\n"
+                        f"- **Data/Hora:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n"
+                        f"- **Limiar Mínimo de Similaridade:** `{min_sim_val:.2f}`\n"
+                        f"- **Limiar Máximo de Similaridade:** `{max_sim_val:.2f}`\n"
+                        f"- **Total de Resultados (Top-K):** `{len(q_res)}`\n"
+                        f"- **Filtros de Classe:** `{', '.join(filter_classes_req) if filter_classes_req else 'Nenhum'}`\n\n---\n\n"
+                        + "\n\n---\n\n".join(
+                            f"### #{r.rank} — Parágrafo `{r.paragraph_id}` (`{r.article_id}`)\n"
+                            f"- **Similaridade Cosseno:** `{r.score:.4f}`\n"
+                            f"- **Classes:** `{', '.join(r.classes)}`\n"
+                            f"- **FAISS ID:** `{r.faiss_id}`\n\n{r.text}"
+                            for r in q_res
+                        )
+                    )
+
+                    col_dl_q1, col_dl_q2 = st.columns(2)
+                    col_dl_q1.download_button(
+                        label="📥 Baixar Resultados da Busca em CSV (.csv)",
+                        data=df_q_export.to_csv(index=False, encoding="utf-8").encode("utf-8"),
+                        file_name=f"busca_rag_{st.session_state.run_id}.csv",
+                        mime="text/csv",
+                        key="btn_dl_rag_search_csv",
+                        use_container_width=True
+                    )
+                    col_dl_q2.download_button(
+                        label="📥 Baixar Resultados da Busca em Markdown (.md)",
+                        data=md_q_export,
+                        file_name=f"busca_rag_{st.session_state.run_id}.md",
+                        mime="text/markdown",
+                        key="btn_dl_rag_search_md",
+                        use_container_width=True
+                    )
+
+                    st.divider()
+                    for r in q_res:
                         classes_badges = " ".join([f"<span style='background-color: #dbeafe; color: #1e40af; font-size: 0.8rem; font-weight: 600; padding: 2px 8px; border-radius: 8px; margin-right: 4px;'>{c}</span>" for c in r.classes])
                         st.markdown(
                             f"<div style='background-color: #f8fafc; border: 1px solid #e2e8f0; border-left: 4px solid #2563eb; padding: 12px 16px; margin-bottom: 10px; border-radius: 4px;'>"
@@ -2637,13 +3429,15 @@ def main():
                             unsafe_allow_html=True
                         )
 
-            # 7. CARREGAMENTO DE ÍNDICE EXISTENTE
-            st.divider()
-            with st.expander("📂 Carregar Índice RAG Existente do Disco ou Arquivo ZIP", expanded=False):
+            # ----------------------------------------------------
+            # SUB-ABA 3: CARREGAMENTO DE ÍNDICE EXISTENTE
+            # ----------------------------------------------------
+            with sub_rag_3:
+                st.subheader("📂 Carregar Índice RAG Existente do Disco ou Arquivo ZIP")
                 col_load_dir, col_load_zip = st.columns(2)
                 with col_load_dir:
                     st.markdown("##### Carregar do Diretório do Projeto")
-                    if st.button("📁 Carregar de output/rag_index/"):
+                    if st.button("📁 Carregar de output/rag_index/", key="btn_load_rag_dir_t7"):
                         target_dir = Path(st.session_state.get("selected_output_dir", DEFAULT_OUTPUT_DIR)) / "rag_index"
                         if not (target_dir / "corpus_refinado.faiss").exists():
                             st.error(f"Nenhum índice encontrado em {target_dir}")
@@ -2661,9 +3455,9 @@ def main():
 
                 with col_load_zip:
                     st.markdown("##### Carregar a partir de arquivo ZIP")
-                    uploaded_zip = st.file_uploader("Enviar pacote rag_index_*.zip", type=["zip"])
+                    uploaded_zip = st.file_uploader("Enviar pacote rag_index_*.zip", type=["zip"], key="upl_rag_zip_t7")
                     if uploaded_zip is not None:
-                        if st.button("📦 Descompactar e Carregar Índice"):
+                        if st.button("📦 Descompactar e Carregar Índice", key="btn_unpack_rag_zip_t7"):
                             try:
                                 retr = RAGIndexRetriever()
                                 target_dir = Path(st.session_state.get("selected_output_dir", DEFAULT_OUTPUT_DIR)) / "rag_index"

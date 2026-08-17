@@ -89,9 +89,11 @@ class RAGIndexRetriever:
         top_k: int = 10,
         required_classes: Optional[List[str]] = None,
         min_score: float = -1.0,
+        max_score: float = 1.0,
     ) -> List[RAGQueryResult]:
         """
-        Executa a recuperação vetorial Top-k no índice FAISS e mapeia os metadados correspondentes.
+        Executa a recuperação vetorial Top-k no índice FAISS e mapeia os metadados correspondentes,
+        com suporte a filtragem por classes e faixa de similaridade [min_score, max_score].
         """
         if not self.is_loaded():
             raise RuntimeError("O índice FAISS e os metadados precisam ser carregados antes da consulta.")
@@ -100,8 +102,9 @@ class RAGIndexRetriever:
         q_vec = embedding_service.encode_queries([query_text], normalize=True).astype(np.float32)
 
         # 2. Busca vetorial no FAISS
-        # Busca uma janela maior se houver filtros conceituais por classe
-        search_k = min(self.faiss_index.ntotal, top_k * 5 if required_classes else top_k)
+        # Busca uma janela maior se houver filtros conceituais por classe ou restrições de score
+        has_score_filter = (min_score > -1.0) or (max_score < 1.0)
+        search_k = min(self.faiss_index.ntotal, top_k * 10 if (required_classes or has_score_filter) else top_k)
         if search_k <= 0:
             return []
 
@@ -117,7 +120,12 @@ class RAGIndexRetriever:
             if faiss_id < 0 or faiss_id >= len(self.metadata_df):
                 continue
 
-            if min_score > 0 and float(s_val) < min_score:
+            val_float = float(s_val)
+
+            # Filtros de Limiar Mínimo e Máximo de Similaridade
+            if min_score > -1.0 and val_float < min_score:
+                continue
+            if max_score < 1.0 and val_float > max_score:
                 continue
 
             row = self.metadata_df.iloc[int(faiss_id)]

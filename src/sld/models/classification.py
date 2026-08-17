@@ -3,7 +3,7 @@ Modelos de dados para registros de parágrafos, anotações multilabel, metadado
 """
 
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from pydantic import BaseModel, Field, ConfigDict
 from src.sld.models.concept_label import validate_and_sanitize_labels, labels_to_binary_vector, CONCEPT_LABEL_SHORT_NAMES
 
@@ -117,31 +117,61 @@ class ModelVersionMetadata(BaseModel):
 
 
 class PerClassMetrics(BaseModel):
-    """Métricas quantitativas para uma classe individual."""
+    """Métricas quantitativas e diagnósticas para uma classe individual."""
     class_name: str
     threshold: float
-    precision: float
-    recall: float
-    f1: float
-    average_precision: float
-    support: int
+    support_positive: int = 0
+    support_negative: int = 0
+    support: int = 0  # alias para support_positive
+    prevalence: float = 0.0
+    true_positives: int = 0
+    false_positives: int = 0
+    false_negatives: int = 0
+    true_negatives: int = 0
+    precision: Optional[float] = None
+    recall: Optional[float] = None
+    specificity: Optional[float] = None
+    f1: Optional[float] = None
+    binary_accuracy: float = 0.0
+    balanced_accuracy: Optional[float] = None
+    fpr: Optional[float] = None
+    fnr: Optional[float] = None
+    average_precision: Optional[float] = None
+    roc_auc: Optional[float] = None
+    f1_ci95: Optional[Tuple[float, float]] = None
+    precision_ci95: Optional[Tuple[float, float]] = None
+    recall_ci95: Optional[Tuple[float, float]] = None
+    is_valid: bool = True
+    note: Optional[str] = ""
 
 
 class EvaluationReport(BaseModel):
-    """Relatório comparativo de avaliação de desempenho dos modelos no test set."""
+    """Relatório comparativo de avaliação de desempenho dos modelos supervisionados."""
     model_id: str
     classifier_type: str
     total_articles: int
     total_paragraphs: int
-    macro_f1: float
-    micro_f1: float
-    weighted_f1: float
-    macro_precision: float = 0.0
-    micro_precision: float = 0.0
-    macro_recall: float = 0.0
-    micro_recall: float = 0.0
+    active_classes_count: int = 5
+    label_cardinality: float = 0.0
+    label_density: float = 0.0
+    macro_f1: Optional[float] = None
+    macro_f1_ci95: Optional[Tuple[float, float]] = None
+    micro_f1: Optional[float] = None
+    micro_f1_ci95: Optional[Tuple[float, float]] = None
+    weighted_f1: Optional[float] = None
+    macro_precision: Optional[float] = None
+    micro_precision: Optional[float] = None
+    macro_recall: Optional[float] = None
+    micro_recall: Optional[float] = None
     hamming_loss: float = 0.0
+    hamming_loss_ci95: Optional[Tuple[float, float]] = None
     subset_accuracy: float = 0.0
-    per_class_metrics: Dict[str, PerClassMetrics]
+    exact_match_ci95: Optional[Tuple[float, float]] = None
+    per_class_metrics: Dict[str, PerClassMetrics]  # Classes ativas 1 a 5
+    class_0_metrics: Optional[PerClassMetrics] = None  # Classe 0 isolada
     confusion_matrices: Dict[str, List[List[int]]] = Field(default_factory=dict)
+    cv_metrics_table: Optional[List[Dict[str, Any]]] = None
+    consistency_checks: Dict[str, Any] = Field(default_factory=dict)
+    leakage_warnings: List[str] = Field(default_factory=list)
+    methodological_alerts: List[str] = Field(default_factory=list)
     evaluation_date: str = Field(default_factory=lambda: datetime.now().isoformat())
